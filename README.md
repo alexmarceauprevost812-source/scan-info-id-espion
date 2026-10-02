@@ -37,8 +37,12 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 6. Oublier un appareil (il sera de nouveau signalé comme nouveau)
 7. Auditer un appareil (ports + vulnérabilités connues, lecture seule)
 8. Vérifier le chiffrement de ton wifi
-9. Exporter un rapport (HTML / CSV / sécurité)
-10. Quitter
+9. Détecter une attaque ARP / usurpation (MITM)
+10. Détecter un serveur DHCP pirate
+11. Auditer MA machine (services en écoute + pare-feu)
+12. Audit AUTOMATIQUE complet du réseau (auto-pentest, lecture seule)
+13. Exporter un rapport (HTML / CSV / sécurité)
+14. Quitter
 
 ## Fonctions
 
@@ -57,8 +61,27 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
   (WPA3/WPA2/WPA/WEP/ouvert) via `nmcli` et explique s'il est sûr.
 - **Notification bureau** : en plus du bip, une notification `notify-send` s'affiche quand
   un appareil inconnu apparaît (si disponible).
+- **Détection d'attaque ARP / MITM** : repère l'usurpation de la passerelle (changement de
+  MAC du routeur, plusieurs MAC pour une IP…) — un signe classique d'attaque « man-in-the-middle ».
+- **Détection de serveur DHCP pirate** : alerte si plusieurs serveurs DHCP répondent
+  (un seul, ton routeur, est normal).
+- **Audit de ta propre machine** : liste les services qui écoutent sur le réseau et vérifie
+  l'état du pare-feu (`ufw`) pour réduire ta surface d'attaque.
+- **Audit automatique complet** (`--audit`) : auto-pentest **en lecture seule** — balaie tous
+  tes appareils (ports + vulnérabilités connues/CVE), vérifie le wifi et ta machine, puis écrit
+  un rapport. Il **détecte** les failles ; il n'en exploite aucune et ne lance aucune attaque réelle.
 - **Export** : rapport HTML, CSV, ou rapport **sécurité** (texte : état du wifi, appareils,
-  ports à risque et recommandations).
+  ports à risque, CVE et recommandations).
+
+## Portée & éthique
+
+Cet outil est **défensif** et fonctionne **en lecture seule** : il observe, détecte et audite.
+Il **n'inclut pas** — et n'inclura pas — de fonctions offensives comme la déauthentification
+(couper un appareil du wifi), le vol de secrets/identifiants ou le cassage de mots de passe,
+même contre tes propres appareils. Les audits de ports/vulnérabilités ne doivent viser que des
+appareils d'un réseau que **tu possèdes ou administres** ; une confirmation t'est demandée avant
+chaque audit. Pour retirer un appareil de ton wifi, passe par ton routeur (mot de passe wifi,
+filtrage MAC, réseau invité).
 
 ## Fichiers créés
 

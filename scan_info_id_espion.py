@@ -258,6 +258,20 @@ def get_local_subnet():
     return None
 
 
+def get_gateway():
+    """Renvoie l'IP de la passerelle (le routeur) via la route par défaut."""
+    try:
+        result = subprocess.run(["ip", "route"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if line.startswith("default"):
+                m = re.search(r"default via (\d{1,3}(?:\.\d{1,3}){3})", line)
+                if m:
+                    return m.group(1)
+    except FileNotFoundError:
+        pass
+    return None
+
+
 def run_nmap(subnet):
     """Repli sur nmap si arp-scan n'est pas installé."""
     if not subnet:
@@ -460,6 +474,244 @@ def do_vuln_scan(known):
             print(f"{RED}nmap n'est pas installé.{RESET}")
         else:
             print(resultat)
+
+
+# --------------------------------------------------------------------------
+# Détection d'attaques (lecture seule) — ARP spoofing / MITM, DHCP pirate
+# --------------------------------------------------------------------------
+def do_arp_spoof_check(known):
+    """Repère les signes d'une attaque de type « usurpation ARP » (ARP spoofing /
+    man-in-the-middle), où un attaquant se fait passer pour le routeur pour
+    intercepter le trafic. Deux signaux :
+      1) l'adresse MAC de la passerelle (routeur) a changé depuis la dernière fois ;
+      2) une même MAC est associée à plusieurs IP, ou plusieurs MAC répondent
+         pour l'IP du routeur.
+    Détection uniquement — l'outil ne modifie rien sur le réseau."""
+    print(f"\n{CYAN}Recherche de signes d'usurpation ARP (MITM)...{RESET}\n")
+
+    gateway = get_gateway()
+    if not gateway:
+        print(f"{YELLOW}Impossible de déterminer l'IP de la passerelle.{RESET}")
+
+    devices = scan_network()
+    if not devices:
+        print(f"{RED}Aucun appareil trouvé — impossible d'analyser.{RESET}")
+        return
+
+    # MAC(s) répondant pour chaque IP et IP(s) par MAC
+    ip_to_macs = {}
+    mac_to_ips = {}
+    for d in devices:
+        ip_to_macs.setdefault(d["ip"], set()).add(d["mac"])
+        mac_to_ips.setdefault(d["mac"], set()).add(d["ip"])
+
+    alertes = []
+
+    # 1) MAC de la passerelle
+    if gateway:
+        gw_macs = ip_to_macs.get(gateway, set())
+        if len(gw_macs) > 1:
+            alertes.append(f"Plusieurs MAC répondent pour la passerelle {gateway} : "
+                           f"{', '.join(gw_macs)} — signe classique d'usurpation ARP.")
+        elif gw_macs:
+            gw_mac = next(iter(gw_macs))
+            cfg = load_config()
+            known_gw = cfg.get("gateway_mac")
+            if known_gw and known_gw != gw_mac:
+                alertes.append(f"La MAC de la passerelle {gateway} a CHANGÉ : "
+                               f"avant {known_gw}, maintenant {gw_mac}. "
+                               f"Cela peut indiquer une attaque (ou un changement de routeur).")
+            elif not known_gw:
+                cfg["gateway_mac"] = gw_mac
+                save_config(cfg)
+                print(f"{DIM}MAC de la passerelle enregistrée comme référence : {gw_mac}{RESET}")
+            print(f"{BOLD}Passerelle :{RESET} {gateway}  →  {gw_mac}")
+
+    # 2) Une même MAC sur plusieurs IP (hors passerelle), signe possible de spoof
+    for mac, ips in mac_to_ips.items():
+        if len(ips) > 1:
+            alertes.append(f"La MAC {mac} répond pour plusieurs IP : {', '.join(sorted(ips))} "
+                           f"— à vérifier (usurpation possible, ou routeur/pont légitime).")
+
+    if alertes:
+        print(f"\n{RED}{BOLD}⚠ Signes suspects détectés :{RESET}")
+        for a in alertes:
+            print(f"{RED} - {a}{RESET}")
+            log_event(f"⚠ ARP suspect — {a}")
+        print(f"\n{YELLOW}Que faire : déconnecte-toi du wifi, redémarre ton routeur, change")
+        print(f"son mot de passe d'administration et le mot de passe wifi. Évite les sites")
+        print(f"sensibles tant que ce n'est pas réglé.{RESET}")
+        beep()
+        notify_desktop("⚠ Attaque réseau possible", "Signes d'usurpation ARP détectés")
+    else:
+        print(f"\n{GREEN}✓ Aucun signe évident d'usurpation ARP.{RESET}")
+
+
+def do_rogue_dhcp_check():
+    """Cherche un serveur DHCP « pirate » : un serveur DHCP non autorisé branché
+    sur le réseau peut rediriger tout ton trafic (attaque MITM). On utilise le
+    script nmap standard, en diffusion — détection uniquement."""
+    print(f"\n{CYAN}Recherche de serveurs DHCP sur le réseau...{RESET}")
+    print(f"{DIM}(un seul serveur DHCP est normal : c'est ton routeur){RESET}\n")
+    try:
+        result = subprocess.run(
+            ["sudo", "nmap", "--script", "broadcast-dhcp-discover"],
+            capture_output=True, text=True, timeout=60
+        )
+    except FileNotFoundError:
+        print(f"{RED}nmap n'est pas installé. Installe-le : sudo apt install nmap{RESET}")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"{YELLOW}⚠ Recherche trop longue, abandonnée.{RESET}")
+        return
+
+    serveurs = re.findall(r"Server Identifier: (\d{1,3}(?:\.\d{1,3}){3})", result.stdout)
+    print(result.stdout.strip() or "(aucune réponse)")
+    serveurs_uniques = sorted(set(serveurs))
+
+    if len(serveurs_uniques) > 1:
+        print(f"\n{RED}{BOLD}⚠ Plusieurs serveurs DHCP détectés : {', '.join(serveurs_uniques)}{RESET}")
+        print(f"{YELLOW}Un seul devrait exister (ton routeur). Un serveur DHCP en trop peut")
+        print(f"être une attaque. Débranche les appareils suspects et préviens.{RESET}")
+        log_event(f"⚠ DHCP multiples : {', '.join(serveurs_uniques)}")
+        beep()
+    elif serveurs_uniques:
+        print(f"\n{GREEN}✓ Un seul serveur DHCP ({serveurs_uniques[0]}) — normal.{RESET}")
+    else:
+        print(f"\n{DIM}Aucun serveur DHCP identifié par le script (pas forcément un problème).{RESET}")
+
+
+# --------------------------------------------------------------------------
+# Audit de TA propre machine (lecture seule) — durcissement
+# --------------------------------------------------------------------------
+def do_self_audit():
+    """Audit de sécurité de TA machine (celle qui lance le script) : services en
+    écoute sur le réseau et état du pare-feu. Aide à réduire ta propre surface
+    d'attaque. Lecture seule — ne modifie aucun réglage."""
+    print(f"\n{CYAN}Audit de ta machine...{RESET}\n")
+
+    # Services en écoute
+    print(f"{BOLD}Services à l'écoute sur le réseau :{RESET}")
+    try:
+        result = subprocess.run(["ss", "-tulnp"], capture_output=True, text=True, timeout=15)
+        lignes = result.stdout.splitlines()
+        if len(lignes) <= 1:
+            print(f"{GREEN}  Aucun service en écoute — très bien.{RESET}")
+        else:
+            expose = False
+            print(DIM + lignes[0] + RESET)
+            for ln in lignes[1:]:
+                # On signale en rouge ce qui écoute sur toutes les interfaces (0.0.0.0 / *)
+                if "0.0.0.0:" in ln or "*:" in ln or "[::]:" in ln:
+                    print(f"{YELLOW}{ln}{RESET}")
+                    expose = True
+                else:
+                    print(ln)
+            if expose:
+                print(f"\n{YELLOW}⚠ Les lignes en jaune écoutent sur TOUTES les interfaces :")
+                print(f"  accessibles depuis le réseau. Si tu n'en as pas besoin, désactive")
+                print(f"  ces services, ou limite-les à 127.0.0.1 (local).{RESET}")
+    except FileNotFoundError:
+        print(f"{RED}  Commande 'ss' absente (paquet iproute2).{RESET}")
+
+    # État du pare-feu
+    print(f"\n{BOLD}Pare-feu :{RESET}")
+    try:
+        ufw = subprocess.run(["sudo", "ufw", "status"], capture_output=True, text=True, timeout=10)
+        sortie = ufw.stdout.strip()
+        if "inactive" in sortie.lower():
+            print(f"{RED}  ufw est INACTIF. Active-le pour bloquer les connexions entrantes :")
+            print(f"    sudo ufw enable{RESET}")
+        elif "active" in sortie.lower():
+            print(f"{GREEN}  ✓ ufw est actif.{RESET}")
+            print(DIM + sortie + RESET)
+        else:
+            print(sortie or "(pas d'information)")
+    except FileNotFoundError:
+        print(f"{DIM}  ufw non installé. Pour un pare-feu simple : sudo apt install ufw{RESET}")
+    except subprocess.TimeoutExpired:
+        print(f"{YELLOW}  Vérification du pare-feu trop longue.{RESET}")
+
+
+def do_full_audit(known, cfg=None):
+    """Audit automatique de TOUT ton réseau (auto-pentest en lecture seule) :
+    1) scan du réseau pour lister les appareils ;
+    2) pour chaque appareil, scan des ports + estimation OS + recherche de
+       vulnérabilités connues (CVE) avec les scripts nmap standards ;
+    3) vérification du wifi et de ta propre machine ;
+    4) rapport de sécurité écrit sur disque.
+    Détection uniquement : aucune faille n'est exploitée, aucune attaque réelle
+    (brute-force, déauthentification…) n'est lancée. À ne faire QUE sur ton réseau."""
+    cfg = cfg if cfg is not None else load_config()
+
+    print(f"\n{BOLD}Audit automatique complet du réseau{RESET}")
+    if not confirm_ownership():
+        print(f"{DIM}Audit annulé.{RESET}")
+        return
+
+    # 1) Découverte
+    print(f"\n{CYAN}[1/4] Découverte des appareils...{RESET}")
+    devices = scan_network()
+    if not devices:
+        print(f"{RED}Aucun appareil trouvé — audit interrompu.{RESET}")
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    update_from_devices(devices, known, now)
+    save_known_devices(known)
+    print(f"{GREEN}{len(devices)} appareil(s) à auditer.{RESET}")
+
+    # 2) Audit de chaque appareil (ports + vulnérabilités)
+    print(f"\n{CYAN}[2/4] Analyse de chaque appareil (peut être long)...{RESET}")
+    for i, d in enumerate(devices, 1):
+        ip, mac = d["ip"], d["mac"]
+        print(f"\n{BOLD}── ({i}/{len(devices)}) {ip}  {mac}{RESET}")
+
+        res = run_port_scan(ip)
+        if res is None:
+            print(f"{RED}nmap n'est pas installé — audit interrompu.{RESET}")
+            return
+        if res.get("timeout"):
+            print(f"{YELLOW}  Délai dépassé, appareil ignoré.{RESET}")
+            continue
+
+        ports = res["ports"]
+        risky = []
+        if not ports:
+            print(f"{GREEN}  Aucun port ouvert.{RESET}")
+        else:
+            for p in ports:
+                alerte = RISKY_PORTS.get(p["port"])
+                marque = f"{RED} ⚠ {alerte}{RESET}" if alerte else ""
+                print(f"  {p['port']:<7}{p['service']:<14}{p['version']}{marque}")
+                if alerte:
+                    risky.append(f"{p['port']}/{p['service']}")
+
+        known[mac]["device_type"] = res["device_type"]
+        known[mac]["os"] = res["os"]
+        known[mac]["risky_ports"] = risky
+
+        # Recherche de vulnérabilités connues (CVE) — scripts nmap standards
+        print(f"{DIM}  Recherche de vulnérabilités connues...{RESET}")
+        vuln = run_vuln_script(ip)
+        cves = sorted(set(re.findall(r"(CVE-\d{4}-\d{4,7})", vuln or "")))
+        if cves:
+            print(f"{RED}  ⚠ Vulnérabilités référencées : {', '.join(cves)}{RESET}")
+            known[mac]["cves"] = cves
+            log_event(f"⚠ CVE sur {ip} ({mac}) : {', '.join(cves)}")
+        else:
+            print(f"{GREEN}  Aucune vulnérabilité connue repérée.{RESET}")
+            known[mac].pop("cves", None)
+        save_known_devices(known)
+
+    # 3) Wifi + machine locale
+    print(f"\n{CYAN}[3/4] Vérification du wifi et de ta machine...{RESET}")
+    do_wifi_check()
+    do_self_audit()
+
+    # 4) Rapport
+    print(f"\n{CYAN}[4/4] Génération du rapport de sécurité...{RESET}")
+    export_security_report(known)
+    print(f"\n{GREEN}{BOLD}✓ Audit complet terminé.{RESET}")
 
 
 # --------------------------------------------------------------------------
@@ -788,6 +1040,8 @@ def export_security_report(known, path=None):
             lignes.append(f"    Type/OS estimé: {info.get('device_type') or '?'} / {info.get('os') or '?'}")
         if info.get("risky_ports"):
             lignes.append(f"    ⚠ Ports à risque détectés: {', '.join(info['risky_ports'])}")
+        if info.get("cves"):
+            lignes.append(f"    ⚠ Vulnérabilités connues (CVE): {', '.join(info['cves'])}")
     lignes.append("")
 
     lignes.append("Recommandations générales:")
@@ -840,8 +1094,12 @@ def print_menu():
     print(f"{CYAN}6.{RESET} Oublier un appareil (le retraiter comme nouveau)")
     print(f"{CYAN}7.{RESET} Auditer un appareil (ports + vulnérabilités connues, lecture seule)")
     print(f"{CYAN}8.{RESET} Vérifier le chiffrement de ton wifi")
-    print(f"{CYAN}9.{RESET} Exporter un rapport (HTML / CSV / sécurité)")
-    print(f"{CYAN}10.{RESET} Quitter")
+    print(f"{CYAN}9.{RESET} Détecter une attaque ARP / usurpation (MITM)")
+    print(f"{CYAN}10.{RESET} Détecter un serveur DHCP pirate")
+    print(f"{CYAN}11.{RESET} Auditer MA machine (services en écoute + pare-feu)")
+    print(f"{CYAN}12.{RESET} Audit AUTOMATIQUE complet du réseau (auto-pentest, lecture seule)")
+    print(f"{CYAN}13.{RESET} Exporter un rapport (HTML / CSV / sécurité)")
+    print(f"{CYAN}14.{RESET} Quitter")
 
 
 def run_menu():
@@ -851,7 +1109,7 @@ def run_menu():
 
     while True:
         print_menu()
-        choix = input("Choix (1-10): ").strip()
+        choix = input("Choix (1-14): ").strip()
         if choix == "1":
             do_scan(known, cfg=cfg)
         elif choix == "2":
@@ -869,8 +1127,16 @@ def run_menu():
         elif choix == "8":
             do_wifi_check()
         elif choix == "9":
-            do_report_menu(known)
+            do_arp_spoof_check(known)
         elif choix == "10":
+            do_rogue_dhcp_check()
+        elif choix == "11":
+            do_self_audit()
+        elif choix == "12":
+            do_full_audit(known, cfg=cfg)
+        elif choix == "13":
+            do_report_menu(known)
+        elif choix == "14":
             print(f"{LIME}À la prochaine!{RESET}")
             break
         else:
@@ -890,6 +1156,8 @@ def main():
                          help="Surveiller en boucle (par défaut toutes les 60 s) et alerter sur tout nouvel appareil")
     parser.add_argument("--report", choices=["html", "csv", "securite"], metavar="FORMAT",
                          help="Exporter un rapport des appareils connus (html, csv ou securite) puis quitter")
+    parser.add_argument("--audit", action="store_true",
+                         help="Lancer l'audit automatique complet du réseau (auto-pentest, lecture seule)")
     args = parser.parse_args()
 
     known = load_known_devices()
@@ -918,6 +1186,11 @@ def main():
     if args.watch is not None:
         print_logo()
         do_watch(known, args.watch, cfg=cfg)
+        return
+
+    if args.audit:
+        print_logo()
+        do_full_audit(known, cfg=cfg)
         return
 
     if args.scan:
