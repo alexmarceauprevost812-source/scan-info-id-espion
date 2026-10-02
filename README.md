@@ -30,21 +30,28 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 ### Menu
 
 1. Scanner le réseau maintenant
-2. Surveillance en continu (alerte intrus)
+2. Surveillance en continu (intrus + connexion/déconnexion)
 3. Voir les appareils déjà connus
 4. Voir l'historique de présence
 5. Renommer un appareil
 6. Oublier un appareil (il sera de nouveau signalé comme nouveau)
-7. Exporter un rapport (HTML / CSV)
-8. Quitter
+7. Auditer un appareil (ports + vulnérabilités connues, lecture seule)
+8. Exporter un rapport (HTML / CSV)
+9. Quitter
 
 ## Fonctions
 
 - **Détection des nouveaux appareils** : tout appareil jamais vu est signalé `🆕 NOUVEAU`.
 - **Alerte intrus** : bip sonore + alerte e-mail optionnelle quand un appareil inconnu apparaît.
-- **Surveillance en continu** (`--watch`) : rescan automatique à intervalle régulier.
+- **Surveillance en continu** (`--watch`) : rescan automatique à intervalle régulier, avec
+  détection des nouveaux appareils **et** des connexions/déconnexions des appareils connus.
 - **Historique de présence** : première/dernière fois vu, nombre de fois vu, et journal horodaté.
 - **Identification** : nom réseau (reverse DNS) et fabricant (via arp-scan/nmap).
+- **Audit de sécurité (lecture seule)** : pour un appareil **de ton réseau**, liste les ports
+  ouverts, estime le type d'appareil/OS et, en option, recherche des vulnérabilités connues
+  (CVE) avec les scripts `nmap --script vuln`. C'est de la **détection** : l'outil ne se
+  connecte à rien et n'exploite rien. Une confirmation que tu administres bien le réseau
+  est demandée avant chaque audit.
 - **Export** : rapport HTML ou CSV des appareils connus.
 
 ## Fichiers créés

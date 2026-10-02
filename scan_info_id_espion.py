@@ -7,10 +7,11 @@ ou un appareil suspect sur ton wifi).
 À utiliser UNIQUEMENT sur un réseau que tu possèdes ou administres
 (ton wifi maison, par exemple).
 
-C'est un outil DÉFENSIF : il observe et signale. Il n'attaque pas les
-appareils des autres (pas de déauthentification, pas de vol de secrets).
-Pour retirer un appareil, passe par ton routeur (filtrage MAC, mot de
-passe wifi, réseau invité).
+C'est un outil DÉFENSIF, en lecture seule : il observe, signale et audite.
+Il n'attaque pas les appareils des autres — pas de déauthentification,
+pas de vol de secrets/identifiants. Pour retirer un appareil de ton
+réseau, passe par ton routeur (mot de passe wifi, filtrage MAC, réseau
+invité).
 
 Prérequis (un des deux, arp-scan est préférable):
     sudo apt install arp-scan
@@ -287,6 +288,150 @@ def get_hostname(ip):
 
 
 # --------------------------------------------------------------------------
+# Audit de sécurité (lecture seule) — ports + vulnérabilités connues
+# --------------------------------------------------------------------------
+# Ports historiquement à risque — liste informative, pas une liste exhaustive.
+RISKY_PORTS = {
+    "21": "FTP — souvent non chiffré, mots de passe en clair",
+    "23": "Telnet — non chiffré, obsolète, fréquemment visé sur les appareils IoT",
+    "139": "SMB/NetBIOS — a servi de porte d'entrée à plusieurs vers (ex: WannaCry)",
+    "445": "SMB — a servi de porte d'entrée à plusieurs vers (ex: WannaCry/EternalBlue)",
+    "512": "rexec — protocole non chiffré, obsolète",
+    "513": "rlogin — protocole non chiffré, obsolète",
+    "514": "rsh — protocole non chiffré, obsolète",
+    "3389": "RDP — cible fréquente de tentatives de connexion automatisées si exposé",
+    "5900": "VNC — souvent utilisé sans chiffrement ni mot de passe fort",
+}
+
+
+def confirm_ownership():
+    """Avant un audit d'un appareil, on rappelle le cadre légal et on demande
+    confirmation que l'utilisateur administre bien le réseau. Scanner les
+    appareils d'autres personnes sans autorisation peut être illégal."""
+    print(f"{YELLOW}⚠ L'audit de ports/vulnérabilités ne doit viser que des appareils")
+    print(f"  d'un réseau que TU possèdes ou administres, avec l'accord de leur")
+    print(f"  propriétaire. Scanner l'appareil de quelqu'un d'autre sans accord")
+    print(f"  peut être illégal.{RESET}")
+    rep = input("Confirmes-tu que c'est bien ton réseau/ton appareil ? (o/n): ").strip().lower()
+    return rep == "o"
+
+
+def run_port_scan(ip):
+    """Scanne les ports ouverts, les services actifs ET essaie de deviner le type
+    d'appareil / système d'exploitation (nmap -sV -O). C'est une estimation basée
+    sur des empreintes réseau connues, pas une certitude. Détection seulement —
+    n'essaie jamais de se connecter ou d'exploiter quoi que ce soit."""
+    try:
+        result = subprocess.run(
+            ["sudo", "nmap", "-sV", "-O", "--osscan-guess", "--open", ip],
+            capture_output=True, text=True, timeout=120
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return {"ports": [], "os": None, "device_type": None, "timeout": True}
+
+    ports = []
+    os_info = None
+    device_type = None
+    port_pattern = re.compile(r"^(\d+)/tcp\s+open\s+(\S+)\s*(.*)$")
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        m = port_pattern.match(line)
+        if m:
+            port, service, version = m.groups()
+            ports.append({"port": port, "service": service, "version": version.strip()})
+        elif line.startswith("Running:"):
+            os_info = line.replace("Running:", "").strip()
+        elif line.startswith("OS details:") and not os_info:
+            os_info = line.replace("OS details:", "").strip()
+        elif line.startswith("Device type:"):
+            device_type = line.replace("Device type:", "").strip()
+
+    return {"ports": ports, "os": os_info, "device_type": device_type, "timeout": False}
+
+
+def run_vuln_script(ip):
+    """Lance les scripts de détection de vulnérabilités connues (NSE 'vuln') de nmap.
+    C'est un outil standard d'audit de sécurité : il détecte des failles connues (CVE)
+    en comparant les versions de services — il n'exploite jamais rien."""
+    try:
+        result = subprocess.run(
+            ["sudo", "nmap", "--script", "vuln", ip],
+            capture_output=True, text=True, timeout=240
+        )
+        return result.stdout
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return "(scan abandonné après 4 minutes — trop long)"
+
+
+def do_vuln_scan(known):
+    """Analyse un appareil déjà connu : ports ouverts à risque, puis en option
+    une recherche de vulnérabilités connues (CVE) avec les scripts nmap standards.
+    Audit en lecture seule — ne se connecte à rien, n'exploite rien."""
+    if not known:
+        print(f"{YELLOW}\nAucun appareil enregistré pour l'instant. Fais un scan d'abord (option 1).{RESET}")
+        return
+
+    do_list(known)
+    mac = input("\nAdresse MAC à analyser: ").strip().lower()
+    if mac not in known or not known[mac].get("last_ip"):
+        print(f"{RED}Appareil pas trouvé ou IP inconnue — refais un scan réseau (option 1) d'abord.{RESET}")
+        return
+
+    if not confirm_ownership():
+        print(f"{DIM}Audit annulé.{RESET}")
+        return
+
+    ip = known[mac]["last_ip"]
+    print(f"\n{CYAN}Analyse de {ip}...{RESET}\n")
+
+    resultat_scan = run_port_scan(ip)
+    if resultat_scan is None:
+        print(f"{RED}nmap n'est pas installé. Installe-le: sudo apt install nmap{RESET}")
+        return
+    if resultat_scan.get("timeout"):
+        print(f"{YELLOW}⚠ L'analyse des ports a dépassé le délai d'attente.{RESET}")
+        return
+
+    ports = resultat_scan["ports"]
+
+    if resultat_scan["device_type"] or resultat_scan["os"]:
+        print(f"{BOLD}Type d'appareil (estimation):{RESET} {resultat_scan['device_type'] or '?'}")
+        print(f"{BOLD}Système probable:{RESET} {resultat_scan['os'] or '?'}\n")
+    else:
+        print(f"{DIM}Impossible de deviner le type d'appareil ou le système (normal, pas une erreur).{RESET}\n")
+
+    if not ports:
+        print(f"{GREEN}Aucun port ouvert détecté — bon signe.{RESET}")
+    else:
+        print(f"{BOLD}{'Port':<8}{'Service':<15}{'Version'}{RESET}")
+        print(DIM + "-" * 70 + RESET)
+        for p in ports:
+            alerte = RISKY_PORTS.get(p["port"])
+            couleur = RED if alerte else ""
+            print(f"{couleur}{p['port']:<8}{p['service']:<15}{p['version']}{RESET}")
+            if alerte:
+                print(f"{YELLOW}   ⚠ {alerte}{RESET}")
+
+    reponse = input(
+        f"\n{DIM}Lancer aussi une recherche de vulnérabilités connues (CVE)? "
+        f"Peut prendre 1-4 minutes. (o/n): {RESET}"
+    ).strip().lower()
+
+    if reponse == "o":
+        print(f"\n{CYAN}Recherche de vulnérabilités en cours...{RESET}\n")
+        resultat = run_vuln_script(ip)
+        if resultat is None:
+            print(f"{RED}nmap n'est pas installé.{RESET}")
+        else:
+            print(resultat)
+
+
+# --------------------------------------------------------------------------
 # Cœur du scan : mise à jour de l'état + détection des nouveaux
 # --------------------------------------------------------------------------
 def update_from_devices(devices, known, now):
@@ -356,7 +501,7 @@ def do_scan(known, cfg=None, quiet=False):
 
     if new_devices:
         print(f"\n{YELLOW}⚠ Appareil(s) jamais vus avant — vérifie que tu les reconnais tous.{RESET}")
-        print(f"{YELLOW}  Utilise l'option 3 du menu pour en renommer un.{RESET}")
+        print(f"{YELLOW}  Utilise l'option 5 du menu pour en renommer un.{RESET}")
         if cfg.get("beep", True):
             beep()
         send_email_alert(new_devices, cfg)
@@ -365,19 +510,58 @@ def do_scan(known, cfg=None, quiet=False):
 
 
 # --------------------------------------------------------------------------
-# Surveillance en boucle
+# Surveillance en continu (nouvel appareil + connexion/déconnexion)
 # --------------------------------------------------------------------------
 def do_watch(known, interval, cfg=None):
-    """Scanne en boucle toutes les `interval` secondes et alerte sur tout nouvel appareil."""
+    """Scanne en boucle toutes les `interval` secondes. Alerte sur :
+       - tout appareil JAMAIS VU (intrus potentiel) : bip + e-mail + journal ;
+       - toute connexion / déconnexion d'un appareil connu (présence).
+    Ne regarde jamais ce qu'un appareil fait — seulement s'il est présent.
+    Ctrl+C pour arrêter."""
     cfg = cfg if cfg is not None else load_config()
     interval = max(15, int(interval))  # on évite de marteler le réseau
     print(f"{CYAN}Surveillance active — scan toutes les {interval} s. Ctrl+C pour arrêter.{RESET}")
     log_event(f"Surveillance démarrée (intervalle {interval}s)")
+
+    presents_avant = None
     try:
         while True:
             print(f"\n{DIM}{'=' * 60}{RESET}")
             print(f"{DIM}Scan — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
-            do_scan(known, cfg=cfg, quiet=True)
+
+            devices = scan_network()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            heure = datetime.now().strftime("%H:%M:%S")
+
+            new_devices = update_from_devices(devices, known, now)
+            presents_maintenant = {d["mac"] for d in devices}
+
+            # Connexions / déconnexions (seulement après le 1er tour de boucle)
+            if presents_avant is not None:
+                for mac in presents_maintenant - presents_avant:
+                    if any(d["mac"] == mac for d in new_devices):
+                        continue  # déjà annoncé comme NOUVEAU
+                    nom = known.get(mac, {}).get("name") or known.get(mac, {}).get("hostname") or mac
+                    print(f"{GREEN}[{heure}] 🟢 {nom} s'est connecté au réseau{RESET}")
+                    log_event(f"🟢 connexion — {nom} ({mac})")
+                for mac in presents_avant - presents_maintenant:
+                    nom = known.get(mac, {}).get("name") or known.get(mac, {}).get("hostname") or mac
+                    print(f"{YELLOW}[{heure}] 🔴 {nom} s'est déconnecté du réseau{RESET}")
+                    log_event(f"🔴 déconnexion — {nom} ({mac})")
+
+            if new_devices:
+                for d in new_devices:
+                    nom = d.get("hostname") or d["mac"]
+                    print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil : {d['ip']} {d['mac']} "
+                          f"({d.get('vendor') or '?'}){RESET}")
+                if cfg.get("beep", True):
+                    beep()
+                send_email_alert(new_devices, cfg)
+            else:
+                print(f"{DIM}{len(devices)} appareil(s) présent(s), rien de nouveau.{RESET}")
+
+            save_known_devices(known)
+            presents_avant = presents_maintenant
             time.sleep(interval)
     except KeyboardInterrupt:
         print(f"\n{LIME}Surveillance arrêtée.{RESET}")
@@ -526,13 +710,14 @@ def do_watch_menu(known, cfg):
 def print_menu():
     print(f"\n{CYAN}{BOLD}=== scan-info-id-espion ==={RESET}")
     print(f"{CYAN}1.{RESET} Scanner le réseau maintenant")
-    print(f"{CYAN}2.{RESET} Surveillance en continu (alerte intrus)")
+    print(f"{CYAN}2.{RESET} Surveillance en continu (intrus + connexion/déconnexion)")
     print(f"{CYAN}3.{RESET} Voir les appareils déjà connus")
     print(f"{CYAN}4.{RESET} Voir l'historique de présence")
     print(f"{CYAN}5.{RESET} Renommer un appareil")
     print(f"{CYAN}6.{RESET} Oublier un appareil (le retraiter comme nouveau)")
-    print(f"{CYAN}7.{RESET} Exporter un rapport (HTML / CSV)")
-    print(f"{CYAN}8.{RESET} Quitter")
+    print(f"{CYAN}7.{RESET} Auditer un appareil (ports + vulnérabilités connues, lecture seule)")
+    print(f"{CYAN}8.{RESET} Exporter un rapport (HTML / CSV)")
+    print(f"{CYAN}9.{RESET} Quitter")
 
 
 def run_menu():
@@ -542,7 +727,7 @@ def run_menu():
 
     while True:
         print_menu()
-        choix = input("Choix (1-8): ").strip()
+        choix = input("Choix (1-9): ").strip()
         if choix == "1":
             do_scan(known, cfg=cfg)
         elif choix == "2":
@@ -556,8 +741,10 @@ def run_menu():
         elif choix == "6":
             do_forget(known)
         elif choix == "7":
-            do_report_menu(known)
+            do_vuln_scan(known)
         elif choix == "8":
+            do_report_menu(known)
+        elif choix == "9":
             print(f"{LIME}À la prochaine!{RESET}")
             break
         else:
