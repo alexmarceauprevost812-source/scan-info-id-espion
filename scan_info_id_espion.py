@@ -70,11 +70,30 @@ LOGO_ESPION = r"""
 /_____//____/_/   /___/\____/_/ |_/
 """
 
+# Petite caméra de surveillance, affichée en rouge à droite du logo ESPION.
+LOGO_CAMERA = r"""
+   ______________
+  |  ____         |))
+  | | o  |  REC •  |
+  | |____|        |
+  |______________|
+"""
+
 
 def print_logo():
     print(f"{CYAN}{LOGO_SCAN_INFO_ID}{RESET}")
-    print(f"{LIME}{BOLD}{LOGO_ESPION}{RESET}")
-    print(f"{BOLD}🛰️  Détection des appareils sur ton réseau wifi{RESET}")
+
+    # On affiche le logo ESPION (vert) et la caméra (rouge) côte à côte.
+    espion_lines = LOGO_ESPION.strip("\n").splitlines()
+    camera_lines = LOGO_CAMERA.strip("\n").splitlines()
+    largeur = max((len(l) for l in espion_lines), default=0) + 4
+    nb = max(len(espion_lines), len(camera_lines))
+    for i in range(nb):
+        gauche = espion_lines[i] if i < len(espion_lines) else ""
+        droite = camera_lines[i] if i < len(camera_lines) else ""
+        print(f"{LIME}{BOLD}{gauche:<{largeur}}{RESET}{RED}{BOLD}{droite}{RESET}")
+
+    print(f"\n{BOLD}🛰️  Détection des appareils sur ton réseau wifi{RESET}")
     print(f"{DIM}   Repère les appareils inconnus en un coup d'œil{RESET}\n")
 
 
