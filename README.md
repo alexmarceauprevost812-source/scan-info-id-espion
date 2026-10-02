@@ -4,6 +4,8 @@ Découvre les appareils connectés à ton réseau local et signale ceux **jamais
 
 > ⚠️ À utiliser **uniquement** sur un réseau que tu possèdes ou administres (ton wifi maison, par exemple).
 
+C'est un outil **défensif** : il observe et signale. Il n'attaque pas les appareils des autres (pas de déauthentification, pas de vol de secrets/identifiants). Pour retirer un appareil de ton réseau, passe par ton **routeur** : change le mot de passe wifi (WPA2/WPA3), utilise le filtrage MAC, ou mets les invités sur un réseau séparé.
+
 ## Prérequis
 
 - Linux (Kali, Ubuntu, Debian…) avec Python 3
@@ -20,17 +22,59 @@ sudo apt install nmap
 ```bash
 sudo python3 scan_info_id_espion.py                 # menu interactif
 sudo python3 scan_info_id_espion.py --scan          # scan direct, sans menu
+sudo python3 scan_info_id_espion.py --watch 60      # surveillance en boucle (toutes les 60 s)
+sudo python3 scan_info_id_espion.py --report html   # exporte un rapport (html ou csv)
 sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 ```
 
 ### Menu
 
 1. Scanner le réseau maintenant
-2. Voir les appareils déjà connus
-3. Renommer un appareil
-4. Oublier un appareil (il sera de nouveau signalé comme nouveau)
-5. Quitter
+2. Surveillance en continu (alerte intrus)
+3. Voir les appareils déjà connus
+4. Voir l'historique de présence
+5. Renommer un appareil
+6. Oublier un appareil (il sera de nouveau signalé comme nouveau)
+7. Exporter un rapport (HTML / CSV)
+8. Quitter
 
-Les appareils connus sont enregistrés dans `~/.scan_info_id_espion_known_devices.json`.
+## Fonctions
 
-> Note : avec `sudo`, `~` pointe vers le dossier de `root`, donc le fichier se trouve dans `/root/`.
+- **Détection des nouveaux appareils** : tout appareil jamais vu est signalé `🆕 NOUVEAU`.
+- **Alerte intrus** : bip sonore + alerte e-mail optionnelle quand un appareil inconnu apparaît.
+- **Surveillance en continu** (`--watch`) : rescan automatique à intervalle régulier.
+- **Historique de présence** : première/dernière fois vu, nombre de fois vu, et journal horodaté.
+- **Identification** : nom réseau (reverse DNS) et fabricant (via arp-scan/nmap).
+- **Export** : rapport HTML ou CSV des appareils connus.
+
+## Fichiers créés
+
+Dans ton dossier personnel (`~`) :
+
+- `~/.scan_info_id_espion_known_devices.json` — les appareils connus
+- `~/.scan_info_id_espion_history.log` — le journal de présence
+- `~/.scan_info_id_espion_config.json` — la configuration (voir ci-dessous)
+
+> Note : avec `sudo`, `~` pointe vers le dossier de `root` (`/root/`), pas vers ton dossier personnel.
+
+## Alerte e-mail (optionnelle)
+
+Pour recevoir un e-mail quand un appareil inconnu apparaît, crée le fichier de config
+`~/.scan_info_id_espion_config.json` (ou `/root/...` si tu lances avec `sudo`) :
+
+```json
+{
+  "beep": true,
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "user": "ton.adresse@gmail.com",
+    "password": "mot_de_passe_application",
+    "from": "ton.adresse@gmail.com",
+    "to": "ton.adresse@gmail.com"
+  }
+}
+```
+
+> Pour Gmail, utilise un **mot de passe d'application** (pas ton mot de passe principal).
+> Mets `"beep": false` pour couper le bip sonore.
