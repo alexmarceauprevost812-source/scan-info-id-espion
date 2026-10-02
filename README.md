@@ -36,8 +36,9 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 5. Renommer un appareil
 6. Oublier un appareil (il sera de nouveau signalé comme nouveau)
 7. Auditer un appareil (ports + vulnérabilités connues, lecture seule)
-8. Exporter un rapport (HTML / CSV)
-9. Quitter
+8. Vérifier le chiffrement de ton wifi
+9. Exporter un rapport (HTML / CSV / sécurité)
+10. Quitter
 
 ## Fonctions
 
@@ -52,7 +53,12 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
   (CVE) avec les scripts `nmap --script vuln`. C'est de la **détection** : l'outil ne se
   connecte à rien et n'exploite rien. Une confirmation que tu administres bien le réseau
   est demandée avant chaque audit.
-- **Export** : rapport HTML ou CSV des appareils connus.
+- **Vérification du wifi** : détecte le chiffrement du réseau auquel **tu** es connecté
+  (WPA3/WPA2/WPA/WEP/ouvert) via `nmcli` et explique s'il est sûr.
+- **Notification bureau** : en plus du bip, une notification `notify-send` s'affiche quand
+  un appareil inconnu apparaît (si disponible).
+- **Export** : rapport HTML, CSV, ou rapport **sécurité** (texte : état du wifi, appareils,
+  ports à risque et recommandations).
 
 ## Fichiers créés
 

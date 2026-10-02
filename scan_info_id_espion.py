@@ -152,6 +152,29 @@ def beep(times=3):
         time.sleep(0.25)
 
 
+def notify_desktop(title, message):
+    """Notification visuelle sur le bureau (notify-send), si disponible.
+    Pratique pour ne pas rater une détection quand tu n'es pas devant le terminal."""
+    try:
+        subprocess.run(
+            ["notify-send", title, message],
+            capture_output=True, timeout=5
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # pas de notify-send — le bip terminal suffit
+
+
+def alert_new_devices(new_devices, cfg):
+    """Centralise les alertes sur appareils inconnus : bip + notification + e-mail."""
+    if cfg.get("beep", True):
+        beep()
+    for d in new_devices:
+        nom = d.get("hostname") or d.get("vendor") or d["mac"]
+        notify_desktop("⚠ Appareil inconnu détecté",
+                       f"{nom} vient d'apparaître sur ton réseau ({d['ip']})")
+    send_email_alert(new_devices, cfg)
+
+
 def send_email_alert(new_devices, cfg):
     """Envoie une alerte e-mail si la config SMTP est renseignée.
     Config attendue dans ~/.scan_info_id_espion_config.json :
@@ -405,6 +428,7 @@ def do_vuln_scan(known):
     else:
         print(f"{DIM}Impossible de deviner le type d'appareil ou le système (normal, pas une erreur).{RESET}\n")
 
+    risky_found = []
     if not ports:
         print(f"{GREEN}Aucun port ouvert détecté — bon signe.{RESET}")
     else:
@@ -416,6 +440,13 @@ def do_vuln_scan(known):
             print(f"{couleur}{p['port']:<8}{p['service']:<15}{p['version']}{RESET}")
             if alerte:
                 print(f"{YELLOW}   ⚠ {alerte}{RESET}")
+                risky_found.append(f"{p['port']}/{p['service']}")
+
+    # On garde ces infos pour le rapport de sécurité exportable
+    known[mac]["device_type"] = resultat_scan["device_type"]
+    known[mac]["os"] = resultat_scan["os"]
+    known[mac]["risky_ports"] = risky_found
+    save_known_devices(known)
 
     reponse = input(
         f"\n{DIM}Lancer aussi une recherche de vulnérabilités connues (CVE)? "
@@ -429,6 +460,57 @@ def do_vuln_scan(known):
             print(f"{RED}nmap n'est pas installé.{RESET}")
         else:
             print(resultat)
+
+
+# --------------------------------------------------------------------------
+# Vérification du wifi (lecture seule) — ton propre réseau
+# --------------------------------------------------------------------------
+def check_wifi_security():
+    """Vérifie le type de chiffrement du wifi auquel TU es actuellement connecté (nmcli)."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "IN-USE,SSID,SECURITY", "device", "wifi", "list"],
+            capture_output=True, text=True, timeout=15
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+    for line in result.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[0] == "*":
+            return {"ssid": parts[1], "security": parts[2] or "Ouvert (aucun chiffrement)"}
+    return None
+
+
+def do_wifi_check():
+    """Vérifie et explique le niveau de sécurité du wifi auquel tu es connecté."""
+    print(f"\n{CYAN}Vérification du wifi actuel...{RESET}\n")
+    info = check_wifi_security()
+    if info is None:
+        print(f"{RED}Impossible de vérifier — nmcli n'est pas installé ou aucun wifi actif.{RESET}")
+        print(f"{DIM}Essaie: sudo apt install network-manager{RESET}")
+        return
+
+    ssid, sec = info["ssid"], info["security"]
+    print(f"{BOLD}Réseau: {RESET}{ssid}")
+    print(f"{BOLD}Sécurité: {RESET}{sec or 'aucune'}\n")
+
+    sec_upper = (sec or "").upper()
+    if "WEP" in sec_upper or sec_upper in ("", "OUVERT (AUCUN CHIFFREMENT)"):
+        print(f"{RED}⚠ DANGER — ce chiffrement est faible ou absent. N'importe qui à proximité")
+        print(f"peut intercepter ou se connecter facilement. Passe en WPA2 ou WPA3 dans")
+        print(f"les paramètres de ton routeur dès que possible.{RESET}")
+    elif "WPA3" in sec_upper:
+        print(f"{GREEN}✓ Excellent — WPA3 est le standard le plus sécurisé actuellement.{RESET}")
+    elif "WPA2" in sec_upper:
+        print(f"{GREEN}✓ Correct — WPA2 est encore considéré comme sûr.{RESET}")
+    elif "WPA" in sec_upper:
+        print(f"{YELLOW}⚠ WPA (version 1) commence à dater — WPA2 ou WPA3 serait préférable")
+        print(f"si ton routeur le supporte.{RESET}")
+    else:
+        print(f"{YELLOW}Type de sécurité non reconnu: {sec}{RESET}")
+
+    return info
 
 
 # --------------------------------------------------------------------------
@@ -502,9 +584,7 @@ def do_scan(known, cfg=None, quiet=False):
     if new_devices:
         print(f"\n{YELLOW}⚠ Appareil(s) jamais vus avant — vérifie que tu les reconnais tous.{RESET}")
         print(f"{YELLOW}  Utilise l'option 5 du menu pour en renommer un.{RESET}")
-        if cfg.get("beep", True):
-            beep()
-        send_email_alert(new_devices, cfg)
+        alert_new_devices(new_devices, cfg)
 
     return new_devices
 
@@ -554,9 +634,7 @@ def do_watch(known, interval, cfg=None):
                     nom = d.get("hostname") or d["mac"]
                     print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil : {d['ip']} {d['mac']} "
                           f"({d.get('vendor') or '?'}){RESET}")
-                if cfg.get("beep", True):
-                    beep()
-                send_email_alert(new_devices, cfg)
+                alert_new_devices(new_devices, cfg)
             else:
                 print(f"{DIM}{len(devices)} appareil(s) présent(s), rien de nouveau.{RESET}")
 
@@ -682,14 +760,59 @@ def do_forget(known):
         print(f"{RED}Appareil {mac} pas trouvé dans la liste.{RESET}")
 
 
+def export_security_report(known, path=None):
+    """Rapport texte résumant l'état de sécurité du réseau et des appareils."""
+    path = path or os.path.join(HOME, "scan_info_id_espion_securite.txt")
+    lignes = [
+        "=== RAPPORT DE SÉCURITÉ — scan-info-id-espion ===",
+        f"Généré le: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "",
+    ]
+
+    wifi = check_wifi_security()
+    if wifi:
+        lignes.append(f"Wifi actuel: {wifi['ssid']} — sécurité: {wifi['security'] or 'aucune'}")
+    else:
+        lignes.append("Wifi actuel: impossible à vérifier (nmcli non disponible)")
+    lignes.append("")
+
+    lignes.append(f"Appareils connus: {len(known)}")
+    lignes.append("-" * 60)
+    for mac, info in sorted(known.items(), key=lambda kv: kv[1].get("first_seen", "")):
+        nom = info.get("name") or info.get("hostname") or info.get("vendor") or mac
+        lignes.append(f"- {nom} ({mac})")
+        lignes.append(f"    Vu la 1re fois: {info.get('first_seen', '?')}  "
+                      f"| dernière: {info.get('last_seen', '?')}  "
+                      f"| fois vu: {info.get('times_seen', 1)}")
+        if info.get("device_type") or info.get("os"):
+            lignes.append(f"    Type/OS estimé: {info.get('device_type') or '?'} / {info.get('os') or '?'}")
+        if info.get("risky_ports"):
+            lignes.append(f"    ⚠ Ports à risque détectés: {', '.join(info['risky_ports'])}")
+    lignes.append("")
+
+    lignes.append("Recommandations générales:")
+    lignes.append("- Utilise WPA2 ou WPA3 sur ton wifi, jamais WEP ou un réseau ouvert.")
+    lignes.append("- Change les mots de passe par défaut de tes appareils (routeur, caméras, etc.).")
+    lignes.append("- Désactive les services non utilisés (Telnet, FTP) sur tes appareils si possible.")
+    lignes.append("- Mets à jour le firmware de tes appareils régulièrement.")
+    lignes.append("- Si un appareil inconnu persiste malgré tes vérifications, change ton mot de passe wifi.")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lignes))
+    print(f"{GREEN}✓ Rapport de sécurité écrit : {path}{RESET}")
+    return path
+
+
 def do_report_menu(known):
     """Choix du format d'export."""
     if not known:
         print(f"{YELLOW}\nAucun appareil enregistré. Fais un scan d'abord (option 1).{RESET}")
         return
-    fmt = input("Format du rapport (html / csv) [html]: ").strip().lower() or "html"
+    fmt = input("Format du rapport (html / csv / securite) [html]: ").strip().lower() or "html"
     if fmt == "csv":
         export_csv(known)
+    elif fmt in ("securite", "sécurité", "secu", "txt"):
+        export_security_report(known)
     else:
         export_html(known)
 
@@ -716,8 +839,9 @@ def print_menu():
     print(f"{CYAN}5.{RESET} Renommer un appareil")
     print(f"{CYAN}6.{RESET} Oublier un appareil (le retraiter comme nouveau)")
     print(f"{CYAN}7.{RESET} Auditer un appareil (ports + vulnérabilités connues, lecture seule)")
-    print(f"{CYAN}8.{RESET} Exporter un rapport (HTML / CSV)")
-    print(f"{CYAN}9.{RESET} Quitter")
+    print(f"{CYAN}8.{RESET} Vérifier le chiffrement de ton wifi")
+    print(f"{CYAN}9.{RESET} Exporter un rapport (HTML / CSV / sécurité)")
+    print(f"{CYAN}10.{RESET} Quitter")
 
 
 def run_menu():
@@ -727,7 +851,7 @@ def run_menu():
 
     while True:
         print_menu()
-        choix = input("Choix (1-9): ").strip()
+        choix = input("Choix (1-10): ").strip()
         if choix == "1":
             do_scan(known, cfg=cfg)
         elif choix == "2":
@@ -743,8 +867,10 @@ def run_menu():
         elif choix == "7":
             do_vuln_scan(known)
         elif choix == "8":
-            do_report_menu(known)
+            do_wifi_check()
         elif choix == "9":
+            do_report_menu(known)
+        elif choix == "10":
             print(f"{LIME}À la prochaine!{RESET}")
             break
         else:
@@ -762,8 +888,8 @@ def main():
                          help="Scanner directement sans passer par le menu")
     parser.add_argument("--watch", nargs="?", const=60, type=int, metavar="SECONDES",
                          help="Surveiller en boucle (par défaut toutes les 60 s) et alerter sur tout nouvel appareil")
-    parser.add_argument("--report", choices=["html", "csv"], metavar="FORMAT",
-                         help="Exporter un rapport des appareils connus (html ou csv) puis quitter")
+    parser.add_argument("--report", choices=["html", "csv", "securite"], metavar="FORMAT",
+                         help="Exporter un rapport des appareils connus (html, csv ou securite) puis quitter")
     args = parser.parse_args()
 
     known = load_known_devices()
@@ -783,6 +909,8 @@ def main():
     if args.report:
         if args.report == "csv":
             export_csv(known)
+        elif args.report == "securite":
+            export_security_report(known)
         else:
             export_html(known)
         return
