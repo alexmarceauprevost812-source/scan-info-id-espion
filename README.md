@@ -17,15 +17,61 @@ sudo apt install arp-scan
 sudo apt install nmap
 ```
 
-## Utilisation
+## Toutes les commandes
+
+### 1. Installation (une seule fois)
 
 ```bash
-sudo python3 scan_info_id_espion.py                 # menu interactif
-sudo python3 scan_info_id_espion.py --scan          # scan direct, sans menu
-sudo python3 scan_info_id_espion.py --watch 60      # surveillance en boucle (toutes les 60 s)
-sudo python3 scan_info_id_espion.py --report html   # exporte un rapport (html ou csv)
-sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
+# Récupérer le projet
+git clone https://github.com/alexmarceauprevost812-source/scan-info-id-espion.git
+cd scan-info-id-espion
+git checkout claude/relaxed-mendel-cq5r1m
+
+# Installer les outils réseau (nmap est déjà présent sur Kali)
+sudo apt install arp-scan
+sudo apt install nmap
+# Optionnels (en général déjà là sur Kali) :
+sudo apt install network-manager   # pour la vérif wifi (nmcli)
+sudo apt install ufw                # pour l'audit du pare-feu
 ```
+
+### 2. Mettre à jour vers la dernière version
+
+```bash
+cd scan-info-id-espion
+git pull
+```
+
+### 3. Lancer l'outil
+
+```bash
+sudo python3 scan_info_id_espion.py                 # menu interactif (1 à 14)
+```
+
+### 4. Commandes directes (sans passer par le menu)
+
+```bash
+sudo python3 scan_info_id_espion.py --scan                           # scan unique du réseau
+sudo python3 scan_info_id_espion.py --watch 60                       # surveillance en boucle (toutes les 60 s)
+sudo python3 scan_info_id_espion.py --audit                          # audit automatique complet (auto-pentest, lecture seule)
+sudo python3 scan_info_id_espion.py --report html                   # exporte un rapport HTML
+sudo python3 scan_info_id_espion.py --report csv                    # exporte un rapport CSV
+sudo python3 scan_info_id_espion.py --report securite               # exporte le rapport de sécurité (texte)
+sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"   # renommer un appareil
+sudo python3 scan_info_id_espion.py --help                          # afficher l'aide
+```
+
+### Récapitulatif des options
+
+| Option | Effet |
+| --- | --- |
+| *(aucune)* | Ouvre le menu interactif |
+| `--scan` | Scan unique du réseau |
+| `--watch [SECONDES]` | Surveillance en boucle (60 s par défaut) |
+| `--audit` | Audit automatique complet du réseau (lecture seule) |
+| `--report html\|csv\|securite` | Exporte un rapport puis quitte |
+| `--rename MAC "NOM"` | Donne un nom à un appareil puis quitte |
+| `--help` | Affiche l'aide |
 
 ### Menu
 
