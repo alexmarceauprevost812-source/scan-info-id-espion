@@ -1,0 +1,29 @@
+[Unit]
+Description=Marceau — surveillance autonome du réseau local (défensif, lecture seule)
+Documentation=https://github.com/alexmarceauprevost812-source/scan-info-id-espion
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=MARCEAU_HOME=/var/lib/marceau
+Environment=NO_COLOR=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/marceau/marceau.py --auto
+Restart=on-failure
+RestartSec=30
+
+# Durcissement : le service voit le réseau mais presque rien d'autre.
+StateDirectory=marceau
+StateDirectoryMode=0700
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/marceau
+# arp-scan / nmap ont besoin de sockets bruts.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

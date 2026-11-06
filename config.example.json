@@ -1,0 +1,21 @@
+{
+  "beep": true,
+  "network_owner_confirmed": false,
+  "auto": {
+    "interval": 120,
+    "arp_check": true,
+    "dhcp_check_every": 3600,
+    "audit_new_devices": false,
+    "full_audit_every": 0,
+    "report_every": 86400,
+    "subnet": null
+  },
+  "email": {
+    "smtp_host": "",
+    "smtp_port": 587,
+    "user": "ton.adresse@gmail.com",
+    "password": "mot_de_passe_application",
+    "from": "ton.adresse@gmail.com",
+    "to": "ton.adresse@gmail.com"
+  }
+}

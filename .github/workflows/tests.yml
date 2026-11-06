@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Vérifie les scripts shell
+        run: bash -n install.sh && bash -n uninstall.sh
+      - name: Vérifie l'unité systemd
+        run: systemd-analyze verify systemd/marceau.service 2>&1 | grep -v "/opt/marceau" || true

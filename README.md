@@ -1,31 +1,109 @@
-# scan-info-id-espion
+# Marceau
 
-Découvre les appareils connectés à ton réseau local et signale ceux **jamais vus avant** — pratique pour repérer un intrus ou un appareil suspect sur ton wifi.
+*(anciennement **scan-info-id-espion** / Prevost ID Scan)*
+
+Découvre les appareils connectés à ton réseau local et signale ceux **jamais vus avant** : pratique pour repérer un intrus ou un appareil suspect sur ton wifi.
+Depuis la v2, Marceau peut tourner **tout seul** en arrière-plan (mode autonome) : il surveille, détecte, alerte et écrit ses rapports sans que tu aies à ouvrir le menu.
 
 > ⚠️ À utiliser **uniquement** sur un réseau que tu possèdes ou administres (ton wifi maison, par exemple).
 
 C'est un outil **défensif** : il observe et signale. Il n'attaque pas les appareils des autres (pas de déauthentification, pas de vol de secrets/identifiants). Pour retirer un appareil de ton réseau, passe par ton **routeur** : change le mot de passe wifi (WPA2/WPA3), utilise le filtrage MAC, ou mets les invités sur un réseau séparé.
 
-## Prérequis
-
-- Linux (Kali, Ubuntu, Debian…) avec Python 3
-- `arp-scan` (recommandé) ou `nmap` :
+## Installation express (mode autonome au démarrage)
 
 ```bash
-sudo apt install arp-scan
-# ou
-sudo apt install nmap
+git clone https://github.com/alexmarceauprevost812-source/scan-info-id-espion
+cd scan-info-id-espion
+sudo ./install.sh
 ```
 
-## Utilisation
+Le script :
+
+1. installe `python3`, `arp-scan` et `nmap` ;
+2. copie Marceau dans `/opt/marceau` et crée la commande **`marceau`** ;
+3. crée la config `/var/lib/marceau/.marceau_config.json` et te demande si le réseau est **le tien** (sinon les audits automatiques restent coupés) ;
+4. active le service **`marceau.service`**, qui démarre tout seul à chaque allumage.
 
 ```bash
-sudo python3 scan_info_id_espion.py                 # menu interactif
-sudo python3 scan_info_id_espion.py --scan          # scan direct, sans menu
-sudo python3 scan_info_id_espion.py --watch 60      # surveillance en boucle (toutes les 60 s)
-sudo python3 scan_info_id_espion.py --report html   # exporte un rapport (html ou csv)
-sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
+marceau --status            # état du mode autonome + dernières alertes
+journalctl -u marceau -f    # voir le service en direct
+sudo systemctl restart marceau
+sudo ./uninstall.sh         # désinstaller (garde tes données) ; --purge pour tout effacer
 ```
+
+`sudo ./install.sh --no-service` installe juste la commande, sans démarrage automatique.
+
+## Ce que fait le mode autonome
+
+À chaque cycle (toutes les 120 s par défaut) :
+
+| Étape | Par défaut | Réglage dans `"auto"` |
+|---|---|---|
+| Scan du réseau, nouveaux appareils, connexions/déconnexions | ✅ | `interval` (min 15 s) |
+| Détection d'usurpation ARP (MITM) : la MAC du routeur change, ou 2 MAC pour 1 IP | ✅ | `arp_check` |
+| Recherche de serveur DHCP pirate | 1×/heure | `dhcp_check_every` (s, 0 = jamais) |
+| Scan de ports des **nouveaux** appareils | ❌ | `audit_new_devices` + propriétaire confirmé |
+| Audit complet (ports + CVE) de tout le réseau | ❌ | `full_audit_every` (s) + propriétaire confirmé |
+| Rapports HTML + sécurité | 1×/jour | `report_every` (s, 0 = jamais) |
+
+- **Premier lancement** : Marceau *apprend* les appareils présents comme référence, sans alerte. Ensuite, tout inconnu déclenche une alerte.
+- **Alertes** : journal, notification bureau, e-mail (si configuré) et les 20 dernières visibles avec `marceau --status`.
+- **Increvable** : une panne réseau ou une erreur ne tue jamais le service ; le cycle suivant réessaie. Une seule instance à la fois (verrou). `systemctl stop` l'arrête proprement.
+- **Config modifiable à chaud** : les changements sont pris en compte au cycle suivant (sauf `interval` : redémarre le service).
+- **Service durci** : il ne voit que le réseau et `/var/lib/marceau`.
+
+Sans installer, tu peux aussi lancer :
+
+```bash
+sudo python3 marceau.py --auto           # boucle autonome dans le terminal (Ctrl+C pour arrêter)
+sudo python3 marceau.py --auto --once    # un seul cycle (test, cron)
+sudo python3 marceau.py --auto --interval 60
+```
+
+## Configuration
+
+Voir [`config.example.json`](config.example.json) :
+
+```json
+{
+  "beep": true,
+  "network_owner_confirmed": false,
+  "auto": {
+    "interval": 120,
+    "arp_check": true,
+    "dhcp_check_every": 3600,
+    "audit_new_devices": false,
+    "full_audit_every": 0,
+    "report_every": 86400,
+    "subnet": null
+  },
+  "email": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "user": "ton.adresse@gmail.com",
+    "password": "mot_de_passe_application",
+    "from": "ton.adresse@gmail.com",
+    "to": "ton.adresse@gmail.com"
+  }
+}
+```
+
+- `network_owner_confirmed: true` signifie que tu confirmes que c'est **ton** réseau. Sans ça, aucun audit de ports/CVE n'est lancé automatiquement.
+- Pour Gmail, utilise un **mot de passe d'application** (pas ton mot de passe principal). Laisse `smtp_host` vide pour ne pas envoyer d'e-mail.
+- `subnet` sert à forcer le sous-réseau si la détection automatique échoue (ex. `"192.168.1.0/24"`).
+
+## Utilisation manuelle (menu)
+
+```bash
+marceau                                   # (après install.sh) ou : sudo python3 marceau.py
+sudo python3 marceau.py --scan            # scan direct, sans menu
+sudo python3 marceau.py --watch 60        # surveillance en boucle dans le terminal
+sudo python3 marceau.py --report html     # rapport html, csv ou securite
+sudo python3 marceau.py --audit           # audit complet (demande confirmation)
+sudo python3 marceau.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
+```
+
+Les anciennes commandes `scan_info_id_espion.py` fonctionnent toujours.
 
 ### Menu
 
@@ -42,75 +120,32 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 11. Auditer MA machine (services en écoute + pare-feu)
 12. Audit AUTOMATIQUE complet du réseau (auto-pentest, lecture seule)
 13. Exporter un rapport (HTML / CSV / sécurité)
-14. Quitter
+14. **Mode AUTONOME** (Ctrl+C pour revenir au menu)
+15. **État du mode autonome**
+16. Quitter
 
-## Fonctions
+## Fichiers créés
 
-- **Détection des nouveaux appareils** : tout appareil jamais vu est signalé `🆕 NOUVEAU`.
-- **Alerte intrus** : bip sonore + alerte e-mail optionnelle quand un appareil inconnu apparaît.
-- **Surveillance en continu** (`--watch`) : rescan automatique à intervalle régulier, avec
-  détection des nouveaux appareils **et** des connexions/déconnexions des appareils connus.
-- **Historique de présence** : première/dernière fois vu, nombre de fois vu, et journal horodaté.
-- **Identification** : nom réseau (reverse DNS) et fabricant (via arp-scan/nmap).
-- **Audit de sécurité (lecture seule)** : pour un appareil **de ton réseau**, liste les ports
-  ouverts, estime le type d'appareil/OS et, en option, recherche des vulnérabilités connues
-  (CVE) avec les scripts `nmap --script vuln`. C'est de la **détection** : l'outil ne se
-  connecte à rien et n'exploite rien. Une confirmation que tu administres bien le réseau
-  est demandée avant chaque audit.
-- **Vérification du wifi** : détecte le chiffrement du réseau auquel **tu** es connecté
-  (WPA3/WPA2/WPA/WEP/ouvert) via `nmcli` et explique s'il est sûr.
-- **Notification bureau** : en plus du bip, une notification `notify-send` s'affiche quand
-  un appareil inconnu apparaît (si disponible).
-- **Détection d'attaque ARP / MITM** : repère l'usurpation de la passerelle (changement de
-  MAC du routeur, plusieurs MAC pour une IP…) — un signe classique d'attaque « man-in-the-middle ».
-- **Détection de serveur DHCP pirate** : alerte si plusieurs serveurs DHCP répondent
-  (un seul, ton routeur, est normal).
-- **Audit de ta propre machine** : liste les services qui écoutent sur le réseau et vérifie
-  l'état du pare-feu (`ufw`) pour réduire ta surface d'attaque.
-- **Audit automatique complet** (`--audit`) : auto-pentest **en lecture seule** — balaie tous
-  tes appareils (ports + vulnérabilités connues/CVE), vérifie le wifi et ta machine, puis écrit
-  un rapport. Il **détecte** les failles ; il n'en exploite aucune et ne lance aucune attaque réelle.
-- **Export** : rapport HTML, CSV, ou rapport **sécurité** (texte : état du wifi, appareils,
-  ports à risque, CVE et recommandations).
+Dans `/var/lib/marceau` (installé avec `install.sh`), sinon dans ton dossier personnel (`~`, ou `/root` avec `sudo`), ou dans le dossier donné par `MARCEAU_HOME` :
+
+- `.marceau_known_devices.json` : les appareils connus
+- `.marceau_history.log` : le journal (rotation automatique à 5 Mo)
+- `.marceau_config.json` : la configuration
+- `.marceau_status.json` : l'état du mode autonome
+- `marceau_rapport.html`, `marceau_securite.txt` : les rapports
+
+Les fichiers de l'ancien nom (`.scan_info_id_espion_*`) sont repris automatiquement : tu ne perds pas tes appareils connus.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest -q
+```
+
+Les tests simulent le réseau (aucun vrai scan) : parseurs arp-scan/nmap/nmcli, détection ARP et DHCP, apprentissage initial, intrus, connexions/déconnexions, garde-fou propriétaire, rapports, verrou, arrêt par signal. Ils tournent aussi automatiquement sur GitHub (Actions) à chaque push.
 
 ## Portée & éthique
 
 Cet outil est **défensif** et fonctionne **en lecture seule** : il observe, détecte et audite.
-Il **n'inclut pas** — et n'inclura pas — de fonctions offensives comme la déauthentification
-(couper un appareil du wifi), le vol de secrets/identifiants ou le cassage de mots de passe,
-même contre tes propres appareils. Les audits de ports/vulnérabilités ne doivent viser que des
-appareils d'un réseau que **tu possèdes ou administres** ; une confirmation t'est demandée avant
-chaque audit. Pour retirer un appareil de ton wifi, passe par ton routeur (mot de passe wifi,
-filtrage MAC, réseau invité).
-
-## Fichiers créés
-
-Dans ton dossier personnel (`~`) :
-
-- `~/.scan_info_id_espion_known_devices.json` — les appareils connus
-- `~/.scan_info_id_espion_history.log` — le journal de présence
-- `~/.scan_info_id_espion_config.json` — la configuration (voir ci-dessous)
-
-> Note : avec `sudo`, `~` pointe vers le dossier de `root` (`/root/`), pas vers ton dossier personnel.
-
-## Alerte e-mail (optionnelle)
-
-Pour recevoir un e-mail quand un appareil inconnu apparaît, crée le fichier de config
-`~/.scan_info_id_espion_config.json` (ou `/root/...` si tu lances avec `sudo`) :
-
-```json
-{
-  "beep": true,
-  "email": {
-    "smtp_host": "smtp.gmail.com",
-    "smtp_port": 587,
-    "user": "ton.adresse@gmail.com",
-    "password": "mot_de_passe_application",
-    "from": "ton.adresse@gmail.com",
-    "to": "ton.adresse@gmail.com"
-  }
-}
-```
-
-> Pour Gmail, utilise un **mot de passe d'application** (pas ton mot de passe principal).
-> Mets `"beep": false` pour couper le bip sonore.
+Il **n'inclut pas**, et n'inclura pas, de fonctions offensives comme la déauthentification (couper un appareil du wifi), le vol de secrets/identifiants ou le cassage de mots de passe, même contre tes propres appareils. Les audits de ports/vulnérabilités ne doivent viser que des appareils d'un réseau que **tu possèdes ou administres** : le menu demande une confirmation avant chaque audit, et le mode autonome exige `"network_owner_confirmed": true`.
