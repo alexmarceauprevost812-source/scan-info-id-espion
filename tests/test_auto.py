@@ -194,3 +194,17 @@ def test_sigterm_arrete_la_boucle(reseau, monkeypatch):
     monkeypatch.setattr(m, "auto_cycle", cycle)
     assert m.run_auto(once=False, interval=15) == 0
     assert tours["n"] == 1
+
+
+def test_run_auto_relit_les_appareils_a_chaque_cycle(reseau, monkeypatch):
+    """La boucle doit relire known sur le disque (et non garder une copie en
+    mémoire) pour qu'un --rename/forget manuel ne soit pas écrasé."""
+    m.save_known_devices({"99:99:99:99:99:99": {"name": "ajouté à la main",
+                                                "first_seen": "x", "times_seen": 1}})
+    vus = {}
+
+    def capture(known, cfg, state, now_ts=None):
+        vus["known"] = dict(known)
+    monkeypatch.setattr(m, "auto_cycle", capture)
+    m.run_auto(once=True)
+    assert "99:99:99:99:99:99" in vus["known"]  # relu depuis le disque dans la boucle

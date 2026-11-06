@@ -39,6 +39,7 @@ import argparse
 import socket
 import time
 import csv
+import stat
 import shutil
 import signal
 import smtplib
@@ -159,11 +160,27 @@ def load_known_devices():
 
 def _atomic_write_json(path, data):
     """Écrit le JSON dans un fichier temporaire puis le remplace d'un coup :
-    une coupure de courant pendant l'écriture ne corrompt jamais la liste."""
+    une coupure de courant pendant l'écriture ne corrompt jamais la liste.
+    Le fichier temporaire est créé en 0600 (le fichier de config peut contenir
+    un mot de passe e-mail), et on reprend les permissions de la cible si elle
+    existe déjà : os.replace ne doit jamais élargir les droits d'un .json protégé."""
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)  # cible existante → on préserve
+    except OSError:
+        mode = 0o600
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def save_known_devices(devices):
@@ -1440,7 +1457,6 @@ def run_auto(once=False, interval=None):
 
     anciens = {sig: signal.signal(sig, _on_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
 
-    known = load_known_devices()
     cfg = load_config()
     reglages = auto_settings(cfg)
     if interval:
@@ -1469,6 +1485,11 @@ def run_auto(once=False, interval=None):
                 cfg.setdefault("auto", {})
                 cfg_cycle = dict(cfg)
                 cfg_cycle["auto"] = dict(cfg["auto"], interval=reglages["interval"])
+                # On relit les appareils connus à CHAQUE cycle : un renommage
+                # ou un « oublier » fait entre deux cycles par la commande
+                # manuelle (menu, --rename) est ainsi conservé au lieu d'être
+                # écrasé par une copie en mémoire devenue périmée.
+                known = load_known_devices()
                 auto_cycle(known, cfg_cycle, state)
             except Exception as e:  # noqa: BLE001 — un service ne doit jamais mourir
                 state["last_error"] = f"{type(e).__name__}: {e}"

@@ -81,3 +81,27 @@ def test_exports(monkeypatch):
     monkeypatch.setattr(m, "check_wifi_security", lambda: None)
     secu = open(m.export_security_report(known), encoding="utf-8").read()
     assert "23/telnet" in secu and "CVE-2017-0144" in secu
+
+
+def test_atomic_write_preserve_les_permissions_restreintes():
+    import os
+    import stat
+    # Fichier neuf (peut contenir un mot de passe) → 0600 par défaut
+    m.save_config({"email": {"password": "secret"}})
+    mode = stat.S_IMODE(os.stat(m.CONFIG_FILE).st_mode)
+    assert mode == 0o600
+    # Si la cible est déjà restreinte, une réécriture NE l'élargit pas
+    os.chmod(m.CONFIG_FILE, 0o600)
+    m.save_config({"email": {"password": "secret"}, "gateway_mac": "aa:bb:cc:dd:ee:ff"})
+    assert stat.S_IMODE(os.stat(m.CONFIG_FILE).st_mode) == 0o600
+    assert not os.path.exists(m.CONFIG_FILE + ".tmp")
+
+
+def test_atomic_write_preserve_un_mode_large_existant():
+    import os
+    import stat
+    # Si l'admin a volontairement mis 0644, on le garde tel quel
+    m.save_known_devices({})
+    os.chmod(m.KNOWN_DEVICES_FILE, 0o644)
+    m.save_known_devices({"aa": {"name": "x"}})
+    assert stat.S_IMODE(os.stat(m.KNOWN_DEVICES_FILE).st_mode) == 0o644
