@@ -537,19 +537,26 @@ def run_port_scan(ip):
 
 
 def run_vuln_script(ip):
-    """Lance les scripts de détection de vulnérabilités connues (NSE 'vuln') de nmap.
-    C'est un outil standard d'audit de sécurité : il détecte des failles connues (CVE)
-    en comparant les versions de services — il n'exploite jamais rien."""
+    """Lance les scripts de détection de vulnérabilités connues (NSE) de nmap.
+    IMPORTANT : on sélectionne « vuln and safe » et non la catégorie « vuln »
+    seule. La catégorie « vuln » inclut des scripts marqués « exploit » /
+    « intrusive » qui peuvent MODIFIER la cible (p. ex. injecter un compte admin
+    Drupal). Marceau promet de la détection en lecture seule : le filtre « and
+    safe » exclut ces scripts intrusifs et ne garde que ceux marqués sûrs."""
     try:
         result = _run(
-            ["sudo", "nmap", "--script", "vuln", ip],
+            ["sudo", "nmap", "--script", "vuln and safe", ip],
             capture_output=True, text=True, timeout=240
         )
-        return result.stdout
     except FileNotFoundError:
         return None  # nmap absent → résultat non concluant
     except subprocess.TimeoutExpired:
         return None  # délai dépassé → non concluant (surtout PAS un « rien trouvé »)
+    # Sortie non nulle (ex. échec d'initialisation du moteur NSE) → non concluant,
+    # pour ne pas prendre un stdout vide pour un « aucune vulnérabilité ».
+    if getattr(result, "returncode", 0) != 0:
+        return None
+    return result.stdout
 
 
 def do_vuln_scan(known):

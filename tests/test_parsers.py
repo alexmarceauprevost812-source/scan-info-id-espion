@@ -119,3 +119,27 @@ def test_scan_network_passe_le_subnet_a_arp_scan(monkeypatch):
     m.scan_network(subnet="10.0.0.0/24")
     assert vu["cmd"][:2] == ["sudo", "arp-scan"]
     assert "10.0.0.0/24" in vu["cmd"] and "--localnet" not in vu["cmd"]
+
+
+def test_run_vuln_script_scripts_surs_seulement(monkeypatch):
+    """On n'utilise JAMAIS la catégorie « vuln » seule (elle inclut des scripts
+    exploit/intrusive qui modifient la cible) : on filtre « vuln and safe »."""
+    vu = {}
+
+    def faux_run(cmd, **k):
+        vu["cmd"] = cmd
+        return _R("rapport nmap")
+    monkeypatch.setattr(m, "_run", faux_run)
+    assert m.run_vuln_script("192.168.1.10") == "rapport nmap"
+    i = vu["cmd"].index("--script")
+    assert vu["cmd"][i + 1] == "vuln and safe"
+
+
+def test_run_vuln_script_exit_non_nul_est_non_concluant(monkeypatch):
+    """Un nmap qui échoue (code != 0) renvoie None (non concluant), pas un
+    faux « rien trouvé »."""
+    class _RErr:
+        stdout = ""
+        returncode = 1
+    monkeypatch.setattr(m, "_run", lambda cmd, **k: _RErr())
+    assert m.run_vuln_script("192.168.1.10") is None
