@@ -208,3 +208,21 @@ def test_run_auto_relit_les_appareils_a_chaque_cycle(reseau, monkeypatch):
     monkeypatch.setattr(m, "auto_cycle", capture)
     m.run_auto(once=True)
     assert "99:99:99:99:99:99" in vus["known"]  # relu depuis le disque dans la boucle
+
+
+def test_audit_decouvre_un_appareil_absent_du_scan_initial(reseau, monkeypatch):
+    """Un appareil que seul l'audit voit doit déclencher une alerte, pas être
+    ajouté en silence à la liste de confiance (finding Codex)."""
+    cache = {"ip": "192.168.1.77", "mac": "ca:fe:ca:fe:00:77", "vendor": "Furtif"}
+
+    def faux_audit(known, cfg=None, assume_yes=False):
+        assert assume_yes is True
+        # l'audit a son propre scan et apprend un appareil en plus
+        m.update_from_devices([dict(cache)], known, "2026-11-06 12:00")
+    monkeypatch.setattr(m, "do_full_audit", faux_audit)
+
+    cfg = {"network_owner_confirmed": True, "auto": {"full_audit_every": 60}}
+    known, state = dict(DEJA_VU), {}
+    r = m.auto_cycle(known, cfg, state, now_ts=1000)
+    assert cache["mac"] in r["new"]
+    assert any("pendant l'audit" in a and cache["mac"] in a for a in state["alerts"])

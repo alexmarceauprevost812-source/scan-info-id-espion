@@ -1403,7 +1403,17 @@ def auto_cycle(known, cfg, state, now_ts=None):
     # 5) Audit complet périodique (seulement si c'est TON réseau)
     if proprio and _due(state, "last_audit_ts", reglages.get("full_audit_every"), now_ts):
         state["last_audit_ts"] = now_ts
+        avant_audit = set(known)
         do_full_audit(known, cfg=cfg, assume_yes=True)
+        # L'audit fait son PROPRE scan : un appareil qu'il découvre et que le
+        # scan du début de cycle n'avait pas vu ne doit pas être ajouté en
+        # silence à la liste de confiance — on l'alerte comme un nouvel appareil.
+        for mac in sorted(set(known) - avant_audit):
+            info = known[mac]
+            _alerte(state, f"Nouvel appareil (vu pendant l'audit) : "
+                           f"{info.get('last_ip') or '?'} {mac} ({info.get('vendor') or '?'})", cfg)
+            if mac not in resume["new"]:
+                resume["new"].append(mac)
 
     # 6) Rapports périodiques
     if _due(state, "last_report_ts", reglages.get("report_every"), now_ts):
