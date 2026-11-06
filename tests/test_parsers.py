@@ -1,5 +1,11 @@
 import marceau as m
 
+class _R:
+    def __init__(self, out):
+        self.stdout = out
+        self.returncode = 0
+
+
 ARP_SCAN = """Interface: wlan0, type: EN10MB, MAC: 11:22:33:44:55:66, IPv4: 192.168.1.42
 Starting arp-scan 1.10.0 with 256 hosts
 192.168.1.1\taa:bb:cc:00:00:01\tTP-LINK TECHNOLOGIES CO.,LTD.
@@ -100,3 +106,16 @@ def test_run_retire_sudo_si_root(monkeypatch):
     from conftest import REAL_RUN
     REAL_RUN(["sudo", "arp-scan", "--localnet"])
     assert vu["cmd"] == ["arp-scan", "--localnet"]
+
+
+def test_scan_network_passe_le_subnet_a_arp_scan(monkeypatch):
+    """Un subnet configuré doit cibler arp-scan, pas seulement le repli nmap."""
+    vu = {}
+
+    def faux_run(cmd, **k):
+        vu["cmd"] = cmd            # on capture le 1er appel (arp-scan)
+        return _R(ARP_SCAN)
+    monkeypatch.setattr(m, "_run", faux_run)
+    m.scan_network(subnet="10.0.0.0/24")
+    assert vu["cmd"][:2] == ["sudo", "arp-scan"]
+    assert "10.0.0.0/24" in vu["cmd"] and "--localnet" not in vu["cmd"]

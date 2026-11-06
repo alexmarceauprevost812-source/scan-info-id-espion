@@ -105,3 +105,9 @@ def test_atomic_write_preserve_un_mode_large_existant():
     os.chmod(m.KNOWN_DEVICES_FILE, 0o644)
     m.save_known_devices({"aa": {"name": "x"}})
     assert stat.S_IMODE(os.stat(m.KNOWN_DEVICES_FILE).st_mode) == 0o644
+
+
+def test_arp_deux_mac_pour_un_hote_non_passerelle():
+    pirate = dict(TEL, mac="de:ad:be:ef:00:99")
+    alertes, _ = m.detect_arp_anomalies([ROUTEUR, TEL, pirate], "192.168.1.1")
+    assert any(f"IP {TEL['ip']}" in a for a in alertes)

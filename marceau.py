@@ -42,6 +42,7 @@ import csv
 import stat
 import shutil
 import signal
+import tempfile
 import smtplib
 import html as html_mod
 from email.message import EmailMessage
@@ -164,12 +165,15 @@ def _atomic_write_json(path, data):
     Le fichier temporaire est créé en 0600 (le fichier de config peut contenir
     un mot de passe e-mail), et on reprend les permissions de la cible si elle
     existe déjà : os.replace ne doit jamais élargir les droits d'un .json protégé."""
-    tmp = path + ".tmp"
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)  # cible existante → on préserve
     except OSError:
         mode = 0o600
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Fichier temporaire UNIQUE (mkstemp, 0600) dans le même dossier : deux
+    # écritures simultanées (service + commande manuelle) ne partagent plus le
+    # même inode .tmp, donc ne peuvent plus se corrompre mutuellement.
+    dossier = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=dossier, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -369,11 +373,15 @@ def parse_ip_route(stdout):
     return subnet, gateway
 
 
-def run_arp_scan():
-    """Essaie arp-scan d'abord (plus rapide et précis sur un LAN)."""
+def run_arp_scan(subnet=None):
+    """Essaie arp-scan d'abord (plus rapide et précis sur un LAN).
+    Si un sous-réseau est demandé (config « subnet »), on le cible explicitement
+    au lieu de « --localnet » : sur une machine à plusieurs réseaux, c'est bien
+    le réseau choisi qui est surveillé."""
+    cible = [subnet] if subnet else ["--localnet"]
     try:
         result = _run(
-            ["sudo", "arp-scan", "--localnet"],
+            ["sudo", "arp-scan", *cible],
             capture_output=True, text=True, timeout=30
         )
     except FileNotFoundError:
@@ -432,7 +440,7 @@ def run_nmap(subnet, interactive=True):
 
 def scan_network(interactive=True, subnet=None):
     """Renvoie la liste des appareils via arp-scan ou, à défaut, nmap."""
-    devices = run_arp_scan()
+    devices = run_arp_scan(subnet)
     if devices is None:
         devices = run_nmap(subnet or get_local_subnet(), interactive=interactive)
     return devices or []
@@ -639,6 +647,13 @@ def detect_arp_anomalies(devices, gateway, known_gw_mac=None):
                 alertes.append(f"La MAC de la passerelle {gateway} a CHANGÉ : "
                                f"avant {known_gw_mac}, maintenant {gw_mac}. "
                                f"Cela peut indiquer une attaque (ou un changement de routeur).")
+
+    # Plusieurs MAC pour une même IP (hors passerelle, déjà traitée au-dessus) :
+    # signe possible d'usurpation, et capacité annoncée dans le README.
+    for ip, macs in sorted(ip_to_macs.items()):
+        if ip != gateway and len(macs) > 1:
+            alertes.append(f"Plusieurs MAC répondent pour l'IP {ip} : "
+                           f"{', '.join(sorted(macs))} — à vérifier (usurpation possible).")
 
     for mac, ips in sorted(mac_to_ips.items()):
         if len(ips) > 1:
