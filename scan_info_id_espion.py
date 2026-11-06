@@ -429,6 +429,11 @@ def run_port_scan(ip):
         return None
     except subprocess.TimeoutExpired:
         return {"ports": [], "os": None, "device_type": None, "timeout": True}
+    if result.returncode != 0:
+        # nmap a échoué : ce n'est PAS « aucun port ouvert »
+        lignes = (result.stderr or "").strip().splitlines()
+        return {"ports": [], "os": None, "device_type": None, "timeout": False,
+                "erreur": lignes[-1] if lignes else f"nmap a échoué (code {result.returncode})"}
 
     ports = []
     os_info = None
@@ -494,6 +499,9 @@ def do_vuln_scan(known):
         return
     if resultat_scan.get("timeout"):
         print(f"{YELLOW}⚠ L'analyse des ports a dépassé le délai d'attente.{RESET}")
+        return
+    if resultat_scan.get("erreur"):
+        print(f"{RED}⚠ Analyse des ports impossible : {resultat_scan['erreur']}{RESET}")
         return
 
     ports = resultat_scan["ports"]
@@ -734,6 +742,9 @@ def do_full_audit(known, cfg=None):
             return
         if res.get("timeout"):
             print(f"{YELLOW}  Délai dépassé, appareil ignoré.{RESET}")
+            continue
+        if res.get("erreur"):
+            print(f"{RED}  Analyse impossible ({res['erreur']}), appareil ignoré.{RESET}")
             continue
 
         ports = res["ports"]
@@ -1428,6 +1439,7 @@ class Surveillance:
         self.entendus = set()        # entendus par l'écoute depuis le dernier scan réussi
         self.routeurs_vus = {}
         self.alertes_routeur = set()
+        self.nouveaux_tour = 0       # nouveaux signalés en direct depuis le début du scan
 
     # --- écoute -----------------------------------------------------------
     def _lancer_ecoute(self, premiere=False):
@@ -1537,6 +1549,7 @@ class Surveillance:
             modifie = True
             genre, valeur = resultat
             if genre == "nouveau":
+                self.nouveaux_tour += 1
                 print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil (instantané) : {valeur['ip']} "
                       f"{valeur['mac']} — nom et fabricant complétés au prochain scan{RESET}")
                 nouveaux.append(valeur)
@@ -1586,6 +1599,7 @@ class Surveillance:
             print(f"{YELLOW}Pas de réseau : nouvel essai dans {self.interval} s.{RESET}")
             return
 
+        self.nouveaux_tour = 0
         devices = self._scanner_en_ecoutant(reseau)
         heure = _heure()
         if not devices:
@@ -1623,7 +1637,10 @@ class Surveillance:
             for mac in sorted(self.presents_avant - presents_maintenant):
                 print(f"{YELLOW}[{heure}] 🔴 {_nom(self.known, mac)} s'est déconnecté du réseau{RESET}")
                 log_event(f"🔴 déconnexion — {_nom(self.known, mac)} ({mac})")
-        if not new_devices:
+        nb_nouveaux = len(new_devices) + self.nouveaux_tour
+        if nb_nouveaux:
+            print(f"{DIM}{len(presents_maintenant)} appareil(s) présent(s), dont {nb_nouveaux} nouveau(x).{RESET}")
+        else:
             print(f"{DIM}{len(presents_maintenant)} appareil(s) présent(s), rien de nouveau.{RESET}")
 
         save_known_devices(self.known)

@@ -315,6 +315,17 @@ class TestScan(unittest.TestCase):
             self.assertIsNone(sie.run_nmap(None, interactif=False))     # jamais de question en surveillance
         run.assert_not_called()
 
+    def test_scan_de_ports_rate_n_est_pas_propre(self):
+        echec = mock.Mock(stdout="", returncode=1, stderr="TCP/IP fingerprinting (for OS scan) requires root privileges.\nQUITTING!\n")
+        with mock.patch.object(sie.subprocess, "run", return_value=echec):
+            r = sie.run_port_scan("192.168.2.17")
+        self.assertEqual(r["erreur"], "QUITTING!")
+        ok = mock.Mock(stdout="22/tcp open ssh OpenSSH 9.2\n", returncode=0, stderr="")
+        with mock.patch.object(sie.subprocess, "run", return_value=ok):
+            r = sie.run_port_scan("192.168.2.17")
+        self.assertNotIn("erreur", r)
+        self.assertEqual(r["ports"][0]["port"], "22")
+
     def test_vpn_saute_arp_scan(self):
         with mock.patch.object(sie, "run_arp_scan") as arp, \
              mock.patch.object(sie, "run_nmap", return_value=[]) as nmap:
@@ -560,6 +571,7 @@ class TestSurveillance(unittest.TestCase):
         self.assertIn("Réseau surveillé", texte)
         self.assertIn("Maison", texte)
         self.assertIn("Écoute instantanée active sur wlan0", texte)
+        self.assertIn("dont 3 nouveau(x)", texte)       # A, B (scan) + l'intrus (instantané)
         self.assertTrue(FausseEcoute.instances[-1].arretee)    # écoute arrêtée au Ctrl+C
         self.assertTrue(any("Surveillance démarrée" in j and "Maison" in j for j in self.journal))
 
