@@ -226,3 +226,21 @@ def test_audit_decouvre_un_appareil_absent_du_scan_initial(reseau, monkeypatch):
     r = m.auto_cycle(known, cfg, state, now_ts=1000)
     assert cache["mac"] in r["new"]
     assert any("pendant l'audit" in a and cache["mac"] in a for a in state["alerts"])
+
+
+def test_run_auto_migre_avant_de_lire_la_config(reseau, tmp_path):
+    """Mise à jour depuis l'ancien nom : le 1er cycle doit utiliser la config
+    héritée (intervalle, gateway_mac) et ne pas l'écraser."""
+    import json
+    legacy = tmp_path / ".scan_info_id_espion_config.json"
+    legacy.write_text(json.dumps({
+        "gateway_mac": "aa:aa:aa:aa:aa:01",  # == ROUTEUR, référence déjà connue
+        "auto": {"interval": 300},
+    }))
+    m.run_auto(once=True)
+    # config migrée en place, gateway_mac préservé (pas « nouvelle référence »)
+    cfg = json.load(open(m.CONFIG_FILE))
+    assert cfg["gateway_mac"] == "aa:aa:aa:aa:aa:01"
+    assert not legacy.exists()
+    # l'intervalle hérité a bien été pris en compte
+    assert json.load(open(m.STATUS_FILE))["interval"] == 300

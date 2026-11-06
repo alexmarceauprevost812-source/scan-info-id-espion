@@ -1460,6 +1460,11 @@ def run_auto(once=False, interval=None):
         disable_colors()
 
     os.makedirs(DATA_DIR, exist_ok=True)
+    # Reprise de l'ancien nom AVANT de lire la config : sinon, au premier
+    # lancement après la mise à jour, ce cycle partirait d'une config vide
+    # (mauvais intervalle, SMTP ignoré) et pourrait écraser la MAC de
+    # passerelle de référence déjà enregistrée.
+    migrate_legacy_files()
     verrou = _acquire_lock()
     if verrou is None:
         print(f"{RED}Une autre instance autonome de Marceau tourne déjà.{RESET}")
