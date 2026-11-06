@@ -363,10 +363,11 @@ def run_nmap(subnet, interactif=True):
     return devices
 
 
-def scan_network(interactif=True, subnet=None, iface=None):
+def scan_network(interactif=True, subnet=None, iface=None, arp=True):
     """Renvoie la liste des appareils via arp-scan ou, à défaut, nmap.
-    En mode non interactif, renvoie None si aucun des deux n'a pu scanner."""
-    devices = run_arp_scan(iface)
+    En mode non interactif, renvoie None si aucun des deux n'a pu scanner.
+    arp=False (VPN, tunnel) : arp-scan est sauté, nmap vise `subnet`."""
+    devices = run_arp_scan(iface) if arp else None
     if devices is None:
         devices = run_nmap(subnet or get_local_subnet(), interactif=interactif)
         if devices is None:
@@ -834,7 +835,8 @@ def update_from_devices(devices, known, now):
     new_devices = []
     for d in devices:
         mac = d["mac"]
-        hostname = get_hostname(d["ip"])
+        # le nom peut déjà avoir été cherché (surveillance : pendant le scan)
+        hostname = d["hostname"] if "hostname" in d else get_hostname(d["ip"])
         d["hostname"] = hostname
 
         if mac not in known:
@@ -1545,6 +1547,36 @@ class Surveillance:
             alert_new_devices(nouveaux, self.cfg)
         return modifie
 
+    def _scanner_en_ecoutant(self, reseau):
+        """Lance le scan de renfort (et la recherche des noms) dans un fil à
+        part : pendant ce temps, l'écoute continue d'alerter en direct."""
+        arp = reseau.get("arp") is not False
+        resultat = {}
+
+        def travail():
+            try:
+                devices = scan_network(interactif=False, subnet=reseau.get("subnet"),
+                                       iface=reseau["iface"] if arp else None, arp=arp)
+                for d in devices or []:
+                    d["hostname"] = get_hostname(d["ip"])
+                resultat["devices"] = devices
+            except BaseException as e:     # renvoyé au fil principal (Ctrl+C compris)
+                resultat["erreur"] = e
+
+        fil = threading.Thread(target=travail, daemon=True)
+        fil.start()
+        while fil.is_alive():
+            try:
+                premier = self.evenements.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if self.traiter([premier] + _vider(self.evenements)):
+                save_known_devices(self.known)
+        fil.join()
+        if "erreur" in resultat:
+            raise resultat["erreur"]
+        return resultat.get("devices")
+
     def tour_de_scan(self):
         print(f"\n{DIM}{'=' * 60}{RESET}")
         print(f"{DIM}Scan — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
@@ -1554,8 +1586,7 @@ class Surveillance:
             print(f"{YELLOW}Pas de réseau : nouvel essai dans {self.interval} s.{RESET}")
             return
 
-        devices = scan_network(interactif=False, subnet=reseau.get("subnet"),
-                               iface=reseau["iface"] if reseau.get("arp") is not False else None)
+        devices = self._scanner_en_ecoutant(reseau)
         heure = _heure()
         if not devices:
             # Un scan raté n'est pas « tout le monde est parti » : la présence

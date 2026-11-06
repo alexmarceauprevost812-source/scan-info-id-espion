@@ -315,6 +315,13 @@ class TestScan(unittest.TestCase):
             self.assertIsNone(sie.run_nmap(None, interactif=False))     # jamais de question en surveillance
         run.assert_not_called()
 
+    def test_vpn_saute_arp_scan(self):
+        with mock.patch.object(sie, "run_arp_scan") as arp, \
+             mock.patch.object(sie, "run_nmap", return_value=[]) as nmap:
+            self.assertEqual(sie.scan_network(interactif=False, subnet="10.8.0.0/24", arp=False), [])
+        arp.assert_not_called()
+        nmap.assert_called_once_with("10.8.0.0/24", interactif=False)
+
     def test_arp_scan_sur_la_bonne_carte_sans_sudo_inutile(self):
         sortie = mock.Mock(stdout="192.168.1.10\t02:00:00:00:00:0A\tFabricant X\n", returncode=0)
         with mock.patch.object(sie, "_outil", return_value="/usr/sbin/arp-scan"), \
@@ -534,10 +541,9 @@ class TestSurveillance(unittest.TestCase):
             scans=[[A, B], [A, {"ip": "192.168.1.66", "mac": "02:00:00:00:00:0c", "vendor": "Inconnu"}], [A]],
             reseaux=[reseau()] * 10, avant_scan=entend)
 
-        # 1er scan : A et B nouveaux (base vide) ; puis l'intrus, en instantané, une seule fois
-        self.assertEqual(self.alertes[0], ["02:00:00:00:00:0a", "02:00:00:00:00:0b"])
-        self.assertEqual(self.alertes[1], ["02:00:00:00:00:0c"])
-        self.assertEqual(len(self.alertes), 2)
+        # 1er scan : A et B nouveaux (base vide) ; l'intrus, en instantané, une seule fois
+        self.assertCountEqual(self.alertes, [["02:00:00:00:00:0a", "02:00:00:00:00:0b"],
+                                             ["02:00:00:00:00:0c"]])
         self.assertIn("NOUVEL appareil (instantané) : 192.168.1.66 02:00:00:00:00:0c", texte)
         self.assertNotIn("02:00:00:00:00:99", known)          # ma machine n'est pas un appareil
         self.assertIn("02:00:00:00:00:0c", known)
@@ -549,7 +555,8 @@ class TestSurveillance(unittest.TestCase):
         # présent (pas de fausse déconnexion).
         self.assertEqual(texte.count("s'est déconnecté"), 1)
         # le scan vise la carte et le sous-réseau du réseau confirmé
-        self.assertEqual(self.appels_scan[0], {"interactif": False, "subnet": "192.168.1.0/24", "iface": "wlan0"})
+        self.assertEqual(self.appels_scan[0], {"interactif": False, "subnet": "192.168.1.0/24",
+                                               "iface": "wlan0", "arp": True})
         self.assertIn("Réseau surveillé", texte)
         self.assertIn("Maison", texte)
         self.assertIn("Écoute instantanée active sur wlan0", texte)
@@ -579,6 +586,22 @@ class TestSurveillance(unittest.TestCase):
         # l'écoute est relancée sur la nouvelle interface
         self.assertEqual([e.iface for e in FausseEcoute.instances], ["wlan0", "wlan1"])
         self.assertTrue(FausseEcoute.instances[0].arretee)
+
+    def test_alerte_pendant_un_scan_lent(self):
+        A = {"ip": "192.168.1.10", "mac": "02:00:00:00:00:0a", "vendor": "Routeur"}
+        vu_pendant = threading.Event()
+        pendant = []
+
+        def entend(n, ecoute):
+            if n == 1:      # un intrus arrive pendant un scan qui dure
+                ecoute.evenements.put(("02:00:00:00:00:0c", "192.168.1.66"))
+                pendant.append(vu_pendant.wait(2))   # alerte donnée AVANT la fin du scan ?
+
+        alerte = sie.alert_new_devices.side_effect
+        sie.alert_new_devices.side_effect = lambda d, c: (alerte(d, c), vu_pendant.set())
+        self.lancer(scans=[[A], [A]], reseaux=[reseau()] * 10, avant_scan=entend)
+        self.assertEqual(pendant, [True])
+        self.assertIn(["02:00:00:00:00:0c"], self.alertes)
 
     def test_reseau_perdu_puis_retrouve(self):
         A = {"ip": "192.168.1.10", "mac": "02:00:00:00:00:0a", "vendor": "Routeur"}
