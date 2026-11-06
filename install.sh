@@ -35,15 +35,42 @@ install -m 0755 "$ICI/marceau.py" "$DEST/marceau.py"
 install -m 0644 "$ICI/config.example.json" "$DEST/config.example.json"
 
 echo "${VERT}==> Commande « marceau »${RAZ}"
+# Marceau a besoin des privilèges root (arp-scan/nmap, et le dossier de
+# données partagé avec le service est en root:root 0700). Le lanceur se
+# relance donc sous sudo quand on ne l'appelle pas déjà en root, pour que
+# « marceau » et « marceau --status » fonctionnent sans y penser, sans
+# rendre la config (mot de passe e-mail) lisible par tous.
 cat > "$BIN" <<EOF
 #!/bin/sh
 # Même dossier de données que le service : le menu et le mode autonome partagent tout.
+if [ "\$(id -u)" -ne 0 ]; then
+  exec sudo MARCEAU_HOME=$DATA /usr/bin/python3 $DEST/marceau.py "\$@"
+fi
 export MARCEAU_HOME=$DATA
 exec /usr/bin/python3 $DEST/marceau.py "\$@"
 EOF
 chmod 0755 "$BIN"
 
 install -d -m 0700 "$DATA"
+
+# Reprise des données d'une installation précédente (ancien nom inclus) qui
+# vivaient dans un dossier personnel : sans ça, le service repartirait d'une
+# liste vide et perdrait appareils connus, config SMTP et MAC de référence.
+echo "${VERT}==> Reprise d'éventuelles données existantes${RAZ}"
+for base in /root "/home/${SUDO_USER:-}"; do
+  [[ -d "$base" ]] || continue
+  for suf in known_devices.json history.log config.json status.json; do
+    for prefixe in marceau scan_info_id_espion; do
+      src="$base/.${prefixe}_${suf}"
+      dst="$DATA/.marceau_${suf}"
+      if [[ -f "$src" && ! -e "$dst" ]]; then
+        cp -p "$src" "$dst"
+        echo "  repris : $src"
+      fi
+    done
+  done
+done
+
 CONFIG="$DATA/.marceau_config.json"
 if [[ ! -f "$CONFIG" ]]; then
   echo "${VERT}==> Configuration ($CONFIG)${RAZ}"
