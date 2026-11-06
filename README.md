@@ -22,7 +22,7 @@ sudo apt install nmap
 ```bash
 sudo python3 scan_info_id_espion.py                 # menu interactif
 sudo python3 scan_info_id_espion.py --scan          # scan direct, sans menu
-sudo python3 scan_info_id_espion.py --watch 60      # surveillance en boucle (toutes les 60 s)
+sudo python3 scan_info_id_espion.py --watch 15      # temps réel : alerte instantanée + scan de renfort toutes les 15 s
 sudo python3 scan_info_id_espion.py --report html   # exporte un rapport (html ou csv)
 sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 ```
@@ -30,7 +30,7 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 ### Menu
 
 1. Scanner le réseau maintenant
-2. Surveillance en continu (intrus + connexion/déconnexion)
+2. Surveillance en temps réel (nouvel appareil instantané + connexion/déconnexion)
 3. Voir les appareils déjà connus
 4. Voir l'historique de présence
 5. Renommer un appareil
@@ -48,8 +48,22 @@ sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 
 - **Détection des nouveaux appareils** : tout appareil jamais vu est signalé `🆕 NOUVEAU`.
 - **Alerte intrus** : bip sonore + alerte e-mail optionnelle quand un appareil inconnu apparaît.
-- **Surveillance en continu** (`--watch`) : rescan automatique à intervalle régulier, avec
-  détection des nouveaux appareils **et** des connexions/déconnexions des appareils connus.
+- **Surveillance en temps réel** (`--watch`) :
+  - **Confirmation du réseau** au démarrage : interface, nom du wifi et sa sécurité, ton IP,
+    le routeur et sa MAC. Ce qui ne peut pas être lu s'affiche `Indisponible (raison)`,
+    jamais une valeur inventée.
+  - **Alerte instantanée** : l'outil écoute l'ARP du réseau (sans rien envoyer). Tout
+    appareil qui se connecte en émet dès ses premières secondes : un appareil jamais vu
+    est signalé `🆕 NOUVEL appareil (instantané)` tout de suite, avec bip, notification et
+    e-mail. Un appareil connu qui revient est signalé connecté au même moment.
+  - **Scan de renfort** toutes les `SECONDES` (15 minimum, 60 par défaut) : il trouve les
+    appareils silencieux, complète le fabricant et repère les **déconnexions**.
+  - **Changement de réseau** : autre wifi, autre routeur ou MAC du routeur qui change sur
+    le même wifi (signe possible d'usurpation ARP) → alerte, et la surveillance suit le
+    nouveau réseau.
+  - L'écoute instantanée demande `sudo`. Sans elle, l'outil le dit et continue avec les
+    scans seuls. Elle ne voit pas les appareils isolés par ton routeur (réseau invité avec
+    « isolation des clients »).
 - **Historique de présence** : première/dernière fois vu, nombre de fois vu, et journal horodaté.
 - **Identification** : nom réseau (reverse DNS) et fabricant (via arp-scan/nmap).
 - **Audit de sécurité (lecture seule)** : pour un appareil **de ton réseau**, liste les ports
@@ -114,3 +128,12 @@ Pour recevoir un e-mail quand un appareil inconnu apparaît, crée le fichier de
 
 > Pour Gmail, utilise un **mot de passe d'application** (pas ton mot de passe principal).
 > Mets `"beep": false` pour couper le bip sonore.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Le banc n'a besoin d'aucun réseau : les commandes système et l'écoute sont simulées.
+Lancé en root sur Linux, il vérifie aussi une vraie écoute sur l'interface locale `lo`.

@@ -20,7 +20,7 @@ Prérequis (un des deux, arp-scan est préférable):
 Usage:
     sudo python3 scan_info_id_espion.py                 # ouvre le menu interactif
     sudo python3 scan_info_id_espion.py --scan          # scan direct, sans menu
-    sudo python3 scan_info_id_espion.py --watch 60      # surveille en boucle (toutes les 60 s)
+    sudo python3 scan_info_id_espion.py --watch 60      # temps réel : alerte instantanée + scan toutes les 60 s
     sudo python3 scan_info_id_espion.py --report html   # exporte un rapport (html ou csv)
     sudo python3 scan_info_id_espion.py --rename AA:BB:CC:DD:EE:FF "Mon téléphone"
 """
@@ -28,13 +28,17 @@ Usage:
 import subprocess
 import re
 import json
+import shutil
 import sys
 import os
 import argparse
 import socket
 import time
 import csv
+import queue
 import smtplib
+import struct
+import threading
 import html as html_mod
 from email.message import EmailMessage
 from datetime import datetime
@@ -111,8 +115,13 @@ def load_known_devices():
 
 
 def save_known_devices(devices):
-    with open(KNOWN_DEVICES_FILE, "w") as f:
+    # Écriture dans un fichier à part puis remplacement d'un coup : un Ctrl+C
+    # en plein milieu ne laisse jamais un fichier tronqué (qui ferait oublier
+    # tous les appareils connus et les re-signaler comme NOUVEAUX).
+    tmp = KNOWN_DEVICES_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(devices, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, KNOWN_DEVICES_FILE)
 
 
 def load_config():
@@ -242,11 +251,30 @@ def send_email_alert(new_devices, cfg):
 # --------------------------------------------------------------------------
 # Scans réseau
 # --------------------------------------------------------------------------
-def run_arp_scan():
-    """Essaie arp-scan d'abord (plus rapide et précis sur un LAN)."""
+def _outil(nom):
+    """Chemin de l'outil s'il est installé, sinon None. Les outils réseau sont
+    souvent dans /usr/sbin, absent du PATH d'un utilisateur normal."""
+    chemin = os.pathsep.join([os.environ.get("PATH", ""), "/usr/local/sbin", "/usr/sbin", "/sbin"])
+    return shutil.which(nom, path=chemin)
+
+
+def _avec_sudo(cmd):
+    """Ajoute sudo seulement si on n'est pas déjà root."""
+    return cmd if os.geteuid() == 0 else ["sudo"] + cmd
+
+
+def run_arp_scan(iface=None):
+    """Essaie arp-scan d'abord (plus rapide et précis sur un LAN).
+    `iface` force la carte à scanner (sinon arp-scan choisit lui-même).
+    Renvoie None si arp-scan est absent ou n'a rien trouvé."""
+    if not _outil("arp-scan"):
+        return None
+    cmd = _avec_sudo(["arp-scan", "--localnet"])
+    if iface:
+        cmd.append(f"--interface={iface}")
     try:
         result = subprocess.run(
-            ["sudo", "arp-scan", "--localnet"],
+            cmd,
             capture_output=True, text=True, timeout=30
         )
     except FileNotFoundError:
@@ -291,18 +319,30 @@ def get_gateway():
     return None
 
 
-def run_nmap(subnet):
-    """Repli sur nmap si arp-scan n'est pas installé."""
+def run_nmap(subnet, interactif=True):
+    """Repli sur nmap si arp-scan n'est pas installé.
+    En mode non interactif (surveillance), ne pose jamais de question et ne
+    quitte jamais : renvoie None si le scan est impossible."""
     if not subnet:
+        if not interactif:
+            return None
         print("Impossible de détecter le sous-réseau automatiquement.")
         subnet = input("Entre ton sous-réseau (ex: 192.168.1.0/24): ").strip()
 
+    if not _outil("nmap"):
+        if not interactif:
+            return None
+        print("Ni arp-scan ni nmap ne sont installés.")
+        print("Installe-en un: sudo apt install arp-scan   (ou) sudo apt install nmap")
+        sys.exit(1)
     try:
         result = subprocess.run(
-            ["sudo", "nmap", "-sn", subnet],
+            _avec_sudo(["nmap", "-sn", subnet]),
             capture_output=True, text=True, timeout=60
         )
     except FileNotFoundError:
+        if not interactif:
+            return None
         print("Ni arp-scan ni nmap ne sont installés.")
         print("Installe-en un: sudo apt install arp-scan   (ou) sudo apt install nmap")
         sys.exit(1)
@@ -323,12 +363,14 @@ def run_nmap(subnet):
     return devices
 
 
-def scan_network():
-    """Renvoie la liste des appareils via arp-scan ou, à défaut, nmap."""
-    devices = run_arp_scan()
+def scan_network(interactif=True, subnet=None, iface=None):
+    """Renvoie la liste des appareils via arp-scan ou, à défaut, nmap.
+    En mode non interactif, renvoie None si aucun des deux n'a pu scanner."""
+    devices = run_arp_scan(iface)
     if devices is None:
-        subnet = get_local_subnet()
-        devices = run_nmap(subnet)
+        devices = run_nmap(subnet or get_local_subnet(), interactif=interactif)
+        if devices is None:
+            return None
     return devices or []
 
 
@@ -861,60 +903,743 @@ def do_scan(known, cfg=None, quiet=False):
 
 
 # --------------------------------------------------------------------------
-# Surveillance en continu (nouvel appareil + connexion/déconnexion)
+# Temps réel : confirmation du réseau + écoute ARP passive
 # --------------------------------------------------------------------------
-def do_watch(known, interval, cfg=None):
-    """Scanne en boucle toutes les `interval` secondes. Alerte sur :
-       - tout appareil JAMAIS VU (intrus potentiel) : bip + e-mail + journal ;
-       - toute connexion / déconnexion d'un appareil connu (présence).
-    Ne regarde jamais ce qu'un appareil fait — seulement s'il est présent.
-    Ctrl+C pour arrêter."""
-    cfg = cfg if cfg is not None else load_config()
-    interval = max(15, int(interval))  # on évite de marteler le réseau
-    print(f"{CYAN}Surveillance active — scan toutes les {interval} s. Ctrl+C pour arrêter.{RESET}")
-    log_event(f"Surveillance démarrée (intervalle {interval}s)")
+ETH_P_ARP = 0x0806
+PACKET_OUTGOING = 4      # trame envoyée par TA machine (pas par un autre appareil)
+INTERVALLE_MIN = 15      # on évite de marteler le réseau avec les scans actifs
+DELAI_FIN_SCAN = 0.5     # laisse l'écoute livrer ce qu'elle a entendu pendant le scan
+INDISPONIBLE = "Indisponible"
+ARPHRD_ETHER = 1         # wifi et câble : les seules cartes qui parlent ARP ici
+TYPES_INTERFACE = {65534: "tunnel/VPN", 512: "PPP", 772: "boucle locale"}
 
-    presents_avant = None
+
+def parse_arp_frame(frame):
+    """Lit une trame Ethernet brute. Si c'est un paquet ARP (IPv4), renvoie
+    (mac, ip) de l'appareil qui l'a émis, sinon None.
+
+    Tout appareil qui rejoint ton réseau envoie de l'ARP : pour annoncer son
+    adresse, vérifier qu'elle est libre (sonde) ou trouver le routeur. On ne
+    fait qu'écouter : rien n'est envoyé."""
+    if len(frame) < 14:
+        return None
+    offset = 12
+    ethertype = struct.unpack("!H", frame[offset:offset + 2])[0]
+    offset += 2
+    while ethertype in (0x8100, 0x88A8):        # étiquette(s) VLAN
+        if len(frame) < offset + 4:
+            return None
+        ethertype = struct.unpack("!H", frame[offset + 2:offset + 4])[0]
+        offset += 4
+    if ethertype != ETH_P_ARP:
+        return None
+    arp = frame[offset:offset + 28]
+    if len(arp) < 28:
+        return None
+    htype, ptype, hlen, plen, oper = struct.unpack("!HHBBH", arp[:8])
+    if htype != 1 or ptype != 0x0800 or hlen != 6 or plen != 4 or oper not in (1, 2):
+        return None
+    sha, spa, tpa = arp[8:14], arp[14:18], arp[24:28]
+    if sha[0] & 1 or sha == b"\x00" * 6:        # MAC nulle, de diffusion ou multicast
+        return None
+    mac = ":".join(f"{b:02x}" for b in sha)
+    ip = socket.inet_ntoa(spa)
+    if ip == "0.0.0.0":
+        # Sonde ARP : l'appareil n'a pas encore d'IP, il vérifie que celle
+        # qu'il veut prendre est libre. C'est souvent le tout premier signe.
+        ip = socket.inet_ntoa(tpa)
+        if ip == "0.0.0.0":
+            return None
+    return mac, ip
+
+
+def _lire(chemin):
     try:
-        while True:
-            print(f"\n{DIM}{'=' * 60}{RESET}")
-            print(f"{DIM}Scan — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
+        with open(chemin, "r") as f:
+            return f.read()
+    except OSError:
+        return None
 
-            devices = scan_network()
-            now = datetime.now().strftime("%Y-%m-%d %H:%M")
-            heure = datetime.now().strftime("%H:%M:%S")
 
-            new_devices = update_from_devices(devices, known, now)
-            presents_maintenant = {d["mac"] for d in devices}
+def _routes(texte):
+    """Lignes utiles de /proc/net/route : (iface, dest, passerelle, flags,
+    métrique, masque). Les adresses y sont écrites dans l'ordre de la machine."""
+    for ligne in (texte or "").splitlines()[1:]:
+        champs = ligne.split()
+        if len(champs) < 8:
+            continue
+        try:
+            yield (champs[0], int(champs[1], 16), int(champs[2], 16), int(champs[3], 16),
+                   int(champs[6]), int(champs[7], 16))
+        except ValueError:
+            continue
 
-            # Connexions / déconnexions (seulement après le 1er tour de boucle)
-            if presents_avant is not None:
-                for mac in presents_maintenant - presents_avant:
-                    if any(d["mac"] == mac for d in new_devices):
-                        continue  # déjà annoncé comme NOUVEAU
-                    nom = known.get(mac, {}).get("name") or known.get(mac, {}).get("hostname") or mac
-                    print(f"{GREEN}[{heure}] 🟢 {nom} s'est connecté au réseau{RESET}")
-                    log_event(f"🟢 connexion — {nom} ({mac})")
-                for mac in presents_avant - presents_maintenant:
-                    nom = known.get(mac, {}).get("name") or known.get(mac, {}).get("hostname") or mac
-                    print(f"{YELLOW}[{heure}] 🔴 {nom} s'est déconnecté du réseau{RESET}")
-                    log_event(f"🔴 déconnexion — {nom} ({mac})")
 
-            if new_devices:
-                for d in new_devices:
-                    nom = d.get("hostname") or d["mac"]
-                    print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil : {d['ip']} {d['mac']} "
-                          f"({d.get('vendor') or '?'}){RESET}")
-                alert_new_devices(new_devices, cfg)
+def _ip_texte(valeur):
+    return socket.inet_ntoa(struct.pack("=L", valeur))
+
+
+def parse_proc_routes(texte):
+    """Routes par défaut de /proc/net/route, de la meilleure (plus petite
+    métrique) à la moins bonne : liste de (interface, passerelle)."""
+    routes = [(metrique, iface, _ip_texte(gw))
+              for iface, dest, gw, flags, metrique, masque in _routes(texte)
+              if dest == 0 and masque == 0 and flags & 0x1 and flags & 0x2]   # RTF_UP + RTF_GATEWAY
+    routes.sort(key=lambda r: r[0])
+    return [(iface, gw) for _, iface, gw in routes]
+
+
+def parse_proc_route(texte):
+    """(interface, passerelle) de la meilleure route par défaut, ou (None, None)."""
+    routes = parse_proc_routes(texte)
+    return routes[0] if routes else (None, None)
+
+
+def subnet_from_proc_route(texte, iface, ip=None):
+    """Sous-réseau local de `iface` (ex. 192.168.1.0/24), lu dans les routes
+    sans passerelle de /proc/net/route. Préfère celui qui contient `ip` : un
+    réseau Docker ou de VM sur une autre interface n'est jamais choisi."""
+    candidats = sorted(
+        (metrique, dest, masque)
+        for nom, dest, gw, flags, metrique, masque in _routes(texte)
+        if nom == iface and flags & 0x1 and not flags & 0x2 and gw == 0
+        and masque not in (0, 0xFFFFFFFF))
+    if not candidats:
+        return None
+    choix = candidats[0]
+    if ip:
+        try:
+            ip_n = struct.unpack("=L", socket.inet_aton(ip))[0]
+        except OSError:
+            ip_n = None
+        dedans = [c for c in candidats if ip_n is not None and ip_n & c[2] == c[1]]
+        if dedans:
+            choix = max(dedans, key=lambda c: bin(c[2]).count("1"))
+    _, dest, masque = choix
+    return f"{_ip_texte(dest)}/{bin(masque).count('1')}"
+
+
+def parse_proc_arp(texte, ip, iface=None):
+    """MAC connue pour `ip` dans /proc/net/arp (entrée complète, et sur
+    `iface` si on la donne), ou None."""
+    for ligne in (texte or "").splitlines()[1:]:
+        champs = ligne.split()
+        if len(champs) < 6 or champs[0] != ip:
+            continue
+        try:
+            flags = int(champs[2], 16)
+        except ValueError:
+            continue
+        if not flags & 0x2 or champs[3] == "00:00:00:00:00:00":   # ATF_COM : entrée complète
+            continue
+        if iface and champs[5] != iface:
+            continue
+        return champs[3].lower()
+    return None
+
+
+def parse_nmcli_wifi(texte):
+    """Lit la sortie de `nmcli -t -f ACTIVE,SSID,SECURITY device wifi list`
+    et renvoie {"ssid", "security"} du wifi actif, ou None. En mode -t,
+    nmcli échappe les « : » d'un nom de wifi en « \\: »."""
+    for ligne in (texte or "").splitlines():
+        champs, courant, i = [], "", 0
+        while i < len(ligne):
+            c = ligne[i]
+            if c == "\\" and i + 1 < len(ligne):
+                courant += ligne[i + 1]
+                i += 2
+                continue
+            if c == ":":
+                champs.append(courant)
+                courant = ""
             else:
-                print(f"{DIM}{len(devices)} appareil(s) présent(s), rien de nouveau.{RESET}")
+                courant += c
+            i += 1
+        champs.append(courant)
+        if len(champs) >= 3 and champs[0].lower() in ("yes", "oui"):
+            return {"ssid": champs[1], "security": champs[2] or "Ouvert (aucun chiffrement)"}
+    return None
 
-            save_known_devices(known)
-            presents_avant = presents_maintenant
-            time.sleep(interval)
+
+def get_active_wifi(iface):
+    """Nom et sécurité du wifi actif sur `iface`, sans relancer de recherche.
+    Renvoie (infos, None) ou (None, raison)."""
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "ACTIVE,SSID,SECURITY", "device", "wifi", "list",
+             "ifname", iface, "--rescan", "no"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "LC_ALL": "C"},     # « yes » et pas « oui »/« ja »…
+        )
+    except FileNotFoundError:
+        return None, "nmcli n'est pas installé"
+    except subprocess.TimeoutExpired:
+        return None, "nmcli ne répond pas"
+    if result.returncode != 0:
+        erreur = (result.stderr or "").strip().splitlines()
+        return None, (f"nmcli : {erreur[0]}" if erreur else f"nmcli a échoué (code {result.returncode})")
+    info = parse_nmcli_wifi(result.stdout)
+    if info is None:
+        return None, "aucun wifi actif trouvé par nmcli"
+    return info, None
+
+
+def get_own_ip(gateway):
+    """Ton IP sur le réseau : celle que le système utiliserait pour joindre le
+    routeur. Aucune donnée n'est envoyée (UDP sans envoi)."""
+    if not gateway:
+        return None
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((gateway, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        if s is not None:
+            s.close()
+
+
+def interface_hw_type(iface):
+    """Type matériel de l'interface (1 = wifi/câble, 65534 = tunnel…), ou None."""
+    try:
+        return int((_lire(f"/sys/class/net/{iface}/type") or "").strip())
+    except ValueError:
+        return None
+
+
+def get_own_macs():
+    """MAC de toutes les cartes réseau de cette machine (sauf « lo ») : avec
+    deux cartes sur le même réseau, l'autre n'est pas un « nouvel appareil »."""
+    macs = set()
+    try:
+        noms = os.listdir("/sys/class/net")
+    except OSError:
+        return macs
+    for nom in noms:
+        if nom == "lo":
+            continue
+        mac = (_lire(f"/sys/class/net/{nom}/address") or "").strip().lower()
+        if mac and mac != "00:00:00:00:00:00":
+            macs.add(mac)
+    return macs
+
+
+def get_network_info():
+    """Rassemble ce qui identifie le réseau surveillé. Chaque valeur absente
+    est None, avec sa raison dans info["raisons"] — jamais une valeur inventée."""
+    info = {"iface": None, "type": None, "arp": None, "ip": None, "subnet": None,
+            "gateway": None, "gateway_mac": None, "ssid": None,
+            "security": None, "own_mac": None, "raisons": {}}
+    raisons = info["raisons"]
+
+    texte_route = _lire("/proc/net/route")
+    if texte_route is None:
+        raisons["iface"] = "/proc/net/route illisible (Linux seulement)"
+    else:
+        routes = parse_proc_routes(texte_route)
+        if routes:
+            # Un VPN prend souvent la route par défaut : on préfère la vraie
+            # carte (wifi ou câble), celle qui voit les appareils de la maison.
+            info["iface"], info["gateway"] = next(
+                (r for r in routes if interface_hw_type(r[0]) == ARPHRD_ETHER), routes[0])
+        else:
+            raisons["iface"] = "aucune route par défaut : es-tu connecté au réseau ?"
+    if not info["gateway"]:
+        raisons["gateway"] = raisons.get("iface", "aucune route par défaut")
+
+    iface = info["iface"]
+    if iface:
+        hw = interface_hw_type(iface)
+        if hw is None or hw == ARPHRD_ETHER:
+            info["arp"] = True
+            info["type"] = "wifi" if os.path.isdir(f"/sys/class/net/{iface}/wireless") else "filaire"
+        else:
+            info["arp"] = False
+            info["type"] = TYPES_INTERFACE.get(hw, f"autre (type {hw})")
+        mac = (_lire(f"/sys/class/net/{iface}/address") or "").strip().lower()
+        info["own_mac"] = mac if mac and mac != "00:00:00:00:00:00" else None
+
+    if info["gateway"]:
+        if info["arp"]:
+            info["gateway_mac"] = parse_proc_arp(_lire("/proc/net/arp"), info["gateway"], iface)
+            if not info["gateway_mac"]:
+                raisons["gateway_mac"] = "le routeur n'est pas encore dans la table ARP"
+        else:
+            raisons["gateway_mac"] = f"pas d'ARP sur une interface {info['type']}"
+        info["ip"] = get_own_ip(info["gateway"])
+        if not info["ip"]:
+            raisons["ip"] = "adresse locale introuvable"
+
+    if iface:
+        info["subnet"] = subnet_from_proc_route(texte_route, iface, info["ip"])
+        if not info["subnet"]:
+            raisons["subnet"] = f"aucun sous-réseau local sur {iface} dans la table de routage"
+    else:
+        raisons["subnet"] = raisons.get("iface", "interface inconnue")
+
+    if info["type"] == "wifi":
+        wifi, raison = get_active_wifi(iface)
+        if wifi:
+            info["ssid"], info["security"] = wifi["ssid"], wifi["security"]
+        else:
+            raisons["ssid"] = raison
+    elif info["type"] == "filaire":
+        raisons["ssid"] = "réseau filaire (pas de wifi)"
+    elif info["type"]:
+        raisons["ssid"] = f"interface {info['type']} (pas de wifi)"
+    else:
+        raisons["ssid"] = raisons.get("iface", "interface inconnue")
+    return info
+
+
+def _valeur(info, cle):
+    v = info.get(cle)
+    if v:
+        return v
+    raison = info.get("raisons", {}).get(cle)
+    return f"{INDISPONIBLE} ({raison})" if raison else INDISPONIBLE
+
+
+def network_label(info):
+    """Résumé court du réseau, pour le journal et les alertes."""
+    nom = info.get("ssid") or (f"{info.get('type')} {info.get('iface')}" if info.get("iface") else None)
+    return f"{nom or 'réseau inconnu'} (routeur {info.get('gateway') or '?'})"
+
+
+def confirm_network(info):
+    """Affiche le réseau réellement surveillé, pour que tu confirmes que c'est
+    bien le tien avant de lancer la surveillance."""
+    print(f"{BOLD}📡 Réseau surveillé :{RESET}")
+    iface = info.get("iface")
+    print(f"   Interface : {iface + ' (' + info['type'] + ')' if iface else _valeur(info, 'iface')}")
+    if info.get("ssid"):
+        print(f"   Wifi      : {info['ssid']} — sécurité : {info.get('security') or '?'}")
+    else:
+        print(f"   Wifi      : {_valeur(info, 'ssid')}")
+    print(f"   Ton IP    : {_valeur(info, 'ip')}   sous-réseau : {_valeur(info, 'subnet')}")
+    print(f"   Routeur   : {_valeur(info, 'gateway')}  →  MAC {_valeur(info, 'gateway_mac')}")
+    if not iface:
+        print(f"{YELLOW}⚠ Aucun réseau détecté — la surveillance ne verra rien tant que tu n'es pas connecté.{RESET}")
+    elif info.get("arp") is False:
+        print(f"{YELLOW}⚠ {iface} est une interface {info['type']} sans ARP : l'écoute instantanée "
+              f"ne peut pas y voir les appareils de la maison.{RESET}")
+
+
+def fusionner_reseau(ref, nouveau):
+    """nmcli ou la table ARP peuvent rater une lecture. Sur la même interface
+    et le même routeur, on garde la dernière valeur connue au lieu de croire
+    que le wifi a changé."""
+    if (not ref or not nouveau.get("iface") or ref.get("iface") != nouveau.get("iface")
+            or ref.get("gateway") != nouveau.get("gateway")):
+        return nouveau
+    fusion = dict(nouveau)
+    fusion["raisons"] = dict(nouveau.get("raisons", {}))
+    for cle in ("ssid", "security", "gateway_mac", "subnet", "ip", "own_mac"):
+        if not fusion.get(cle) and ref.get(cle):
+            fusion[cle] = ref[cle]
+            fusion["raisons"].pop(cle, None)
+    return fusion
+
+
+def network_changes(avant, apres):
+    """Compare deux états du réseau. Renvoie la liste des changements notables.
+    Le nom du wifi n'est comparé que si on le connaît des deux côtés."""
+    changements = []
+    if avant.get("iface") != apres.get("iface"):
+        changements.append(f"interface {avant.get('iface') or 'aucune'} → {apres.get('iface') or 'aucune'}")
+    if avant.get("ssid") and apres.get("ssid") and avant["ssid"] != apres["ssid"]:
+        changements.append(f"wifi « {avant['ssid']} » → « {apres['ssid']} »")
+    if avant.get("gateway") != apres.get("gateway"):
+        changements.append(f"routeur {avant.get('gateway') or 'aucun'} → {apres.get('gateway') or 'aucun'}")
+    return changements
+
+
+def verifier_routeur(routeurs_vus, alertes_routeur, info):
+    """Retient la MAC du routeur pour chaque réseau (même wifi, même IP de
+    routeur). Si elle change, renvoie un message d'alerte — une seule fois par
+    MAC suspecte — sinon None."""
+    mac, gw = info.get("gateway_mac"), info.get("gateway")
+    if not mac or not gw:
+        return None
+    cle = (info.get("ssid") or f"{info.get('type')}:{info.get('iface')}", gw)
+    premiere = routeurs_vus.setdefault(cle, mac)
+    if mac == premiere or (cle, mac) in alertes_routeur:
+        return None
+    alertes_routeur.add((cle, mac))
+    return (f"MAC du routeur {gw} : {premiere} → {mac} sur le même réseau — possible "
+            f"usurpation ARP (ou routeur remplacé), vérifie avec l'option 9")
+
+
+def _ouvrir_socket_arp(iface):
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+    try:
+        s.bind((iface, ETH_P_ARP))     # Python fait lui-même le htons ici
+        s.settimeout(1.0)
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+def raison_ecoute(erreur, iface=None):
+    """Explique en clair pourquoi l'écoute instantanée n'a pas pu démarrer."""
+    if isinstance(erreur, PermissionError):
+        return "il faut lancer le script avec sudo pour écouter le réseau"
+    if isinstance(erreur, AttributeError):
+        return "ce système ne permet pas l'écoute brute (Linux seulement)"
+    if isinstance(erreur, OSError) and erreur.errno == 19:
+        return f"interface {iface or '?'} introuvable"
+    return f"erreur système : {erreur}"
+
+
+class EcouteArp(threading.Thread):
+    """Écoute passive de l'ARP sur une interface. Chaque appareil entendu est
+    déposé dans la file `evenements` sous la forme (mac, ip). N'envoie rien."""
+
+    def __init__(self, iface, evenements, ouvrir=None):
+        super().__init__(daemon=True)
+        self.iface = iface
+        self.evenements = evenements
+        self._ouvrir = ouvrir or _ouvrir_socket_arp
+        self._arret = threading.Event()
+        self.prete = threading.Event()
+        self.erreur = None
+
+    def run(self):
+        try:
+            sock = self._ouvrir(self.iface)
+        except (OSError, AttributeError) as e:
+            self.erreur = raison_ecoute(e, self.iface)
+            self.prete.set()
+            return
+        self.prete.set()
+        try:
+            while not self._arret.is_set():
+                try:
+                    trame, adresse = sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    self.erreur = f"écoute interrompue : {e}"
+                    break
+                if len(adresse) >= 3 and adresse[2] == PACKET_OUTGOING:
+                    continue    # c'est TA machine qui parle
+                lu = parse_arp_frame(trame)
+                if lu:
+                    self.evenements.put(lu)
+        finally:
+            sock.close()
+
+    def arreter(self):
+        self._arret.set()
+
+
+def demarrer_ecoute(iface, evenements, fabrique=None, arp=True):
+    """Lance l'écoute sur `iface`. Renvoie (ecoute, None) si elle tourne,
+    (None, raison) sinon."""
+    if not iface:
+        return None, "aucune interface réseau active"
+    if not arp:
+        return None, f"interface {iface} sans ARP (VPN ou tunnel ?)"
+    ecoute = (fabrique or EcouteArp)(iface, evenements)
+    ecoute.start()
+    ecoute.prete.wait(3)
+    if ecoute.erreur:
+        return None, ecoute.erreur
+    if not ecoute.prete.is_set():
+        ecoute.arreter()
+        return None, "l'écoute n'a pas démarré à temps"
+    return ecoute, None
+
+
+def handle_live_event(mac, ip, known, presents, own_macs, now):
+    """Traite un appareil entendu en temps réel. Renvoie :
+       ("nouveau", appareil) — jamais vu : à signaler tout de suite ;
+       ("connexion", mac)    — connu, il revient sur le réseau ;
+       ("maj", mac)          — déjà là, sa fiche a juste changé (heure, IP) ;
+       None                  — rien à faire ni à enregistrer."""
+    if mac in own_macs:
+        return None
+    if mac not in known:
+        # Pas de recherche de nom ici : elle retarderait l'alerte. Le nom
+        # réseau et le fabricant sont complétés au prochain scan.
+        known[mac] = {"first_seen": now, "last_seen": now, "times_seen": 1,
+                      "vendor": "", "hostname": None, "last_ip": ip, "name": None}
+        log_event(f"🆕 NOUVEAU appareil (instantané) — {ip}  {mac}")
+        presents.add(mac)
+        return ("nouveau", {"ip": ip, "mac": mac, "vendor": "", "hostname": None})
+    info = known[mac]
+    modifie = info.get("last_seen") != now or info.get("last_ip") != ip
+    info["last_seen"] = now
+    info["last_ip"] = ip
+    if mac not in presents:
+        presents.add(mac)
+        return ("connexion", mac)
+    return ("maj", mac) if modifie else None
+
+
+def _nom(known, mac):
+    info = known.get(mac, {})
+    return info.get("name") or info.get("hostname") or info.get("vendor") or mac
+
+
+def _maintenant():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _heure():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _vider(evenements):
+    """Tout ce que l'écoute a déposé dans la file, sans attendre."""
+    lus = []
+    while True:
+        try:
+            lus.append(evenements.get_nowait())
+        except queue.Empty:
+            return lus
+
+
+# --------------------------------------------------------------------------
+# Surveillance en temps réel (nouvel appareil + connexion/déconnexion)
+# --------------------------------------------------------------------------
+class Surveillance:
+    """État de la surveillance en temps réel (voir do_watch)."""
+
+    def __init__(self, known, interval, cfg, fabrique_ecoute=None):
+        self.known = known
+        self.interval = interval
+        self.cfg = cfg
+        self.fabrique = fabrique_ecoute
+        self.evenements = queue.Queue()
+        self.ecoute = None
+        self.raison_ecoute = None    # dernière raison d'indisponibilité affichée
+        self.reseau = {}
+        self.dernier_reseau = None   # dernier réseau connecté (pour « réseau retrouvé »)
+        self.own_macs = set()
+        self.presents_avant = None   # présents au dernier scan réussi (None : pas encore de base)
+        self.presents = set()        # présents à l'instant (scan + écoute)
+        self.entendus = set()        # entendus par l'écoute depuis le dernier scan réussi
+        self.routeurs_vus = {}
+        self.alertes_routeur = set()
+
+    # --- écoute -----------------------------------------------------------
+    def _lancer_ecoute(self, premiere=False):
+        self.ecoute, raison = demarrer_ecoute(self.reseau.get("iface"), self.evenements,
+                                              self.fabrique, arp=self.reseau.get("arp") is not False)
+        if self.ecoute:
+            if premiere:
+                print(f"{GREEN}⚡ Écoute instantanée active sur {self.ecoute.iface} : un nouvel "
+                      f"appareil est signalé dès qu'il se connecte.{RESET}")
+            else:
+                print(f"{GREEN}⚡ Écoute instantanée active sur {self.ecoute.iface}.{RESET}")
+                log_event(f"écoute instantanée active sur {self.ecoute.iface}")
+            self.raison_ecoute = None
+        elif raison != self.raison_ecoute:
+            print(f"{YELLOW}⚡ Écoute instantanée : {INDISPONIBLE} ({raison}).{RESET}")
+            print(f"{YELLOW}  Détection seulement par scan, toutes les {self.interval} s.{RESET}")
+            if not premiere:
+                log_event(f"écoute instantanée indisponible — {raison}")
+            self.raison_ecoute = raison
+        return raison
+
+    def _arreter_ecoute(self):
+        if self.ecoute:
+            self.ecoute.arreter()
+            self.ecoute = None
+
+    def _rebaser(self):
+        """Autre réseau ou réseau perdu : on repart d'une présence vide (sinon
+        tout le monde serait « déconnecté » puis « connecté » à tort) et d'une
+        file neuve (rien de l'ancien réseau ne se mélange au nouveau)."""
+        self._arreter_ecoute()
+        self.evenements = queue.Queue()
+        self.presents_avant = None
+        self.presents = set()
+        self.entendus = set()
+
+    # --- réseau -----------------------------------------------------------
+    def demarrer(self):
+        self.reseau = get_network_info()
+        confirm_network(self.reseau)
+        if self.reseau.get("iface"):
+            self.dernier_reseau = self.reseau
+            verifier_routeur(self.routeurs_vus, self.alertes_routeur, self.reseau)
+        self.own_macs = get_own_macs() | {m for m in (self.reseau.get("own_mac"),) if m}
+        raison = self._lancer_ecoute(premiere=True)
+        print(f"{CYAN}Scan de renfort toutes les {self.interval} s. Ctrl+C pour arrêter.{RESET}")
+        log_event(f"Surveillance démarrée — {network_label(self.reseau)}, scan toutes les "
+                  f"{self.interval}s, écoute instantanée "
+                  f"{'active' if self.ecoute else 'indisponible (' + str(raison) + ')'}")
+
+    def _verifier_reseau(self):
+        avant = self.reseau
+        nouveau = fusionner_reseau(avant, get_network_info())
+        heure = _heure()
+        if avant.get("iface") and not nouveau.get("iface"):
+            label = network_label(avant)
+            print(f"{RED}{BOLD}[{heure}] ⚠ Réseau perdu ({label}) — en attente de reconnexion.{RESET}")
+            log_event(f"⚠ réseau perdu — {label}")
+            notify_desktop("⚠ Réseau perdu", label)
+            self._rebaser()
+        elif nouveau.get("iface"):
+            reference = avant if avant.get("iface") else self.dernier_reseau
+            changements = network_changes(reference, nouveau) if reference else []
+            if changements:
+                texte = "; ".join(changements)
+                print(f"{RED}{BOLD}[{heure}] ⚠ Le réseau a changé : {texte}{RESET}")
+                log_event(f"⚠ réseau changé — {texte}")
+                notify_desktop("⚠ Réseau changé", texte)
+                confirm_network(nouveau)
+                self._rebaser()
+            elif not avant.get("iface"):
+                etat = "retrouvé" if reference else "détecté"
+                print(f"{GREEN}[{heure}] ✅ Réseau {etat} : {network_label(nouveau)}{RESET}")
+                log_event(f"réseau {etat} — {network_label(nouveau)}")
+                if not reference:
+                    confirm_network(nouveau)
+            alerte = verifier_routeur(self.routeurs_vus, self.alertes_routeur, nouveau)
+            if alerte:
+                print(f"{RED}{BOLD}[{heure}] ⚠ {alerte}{RESET}")
+                log_event(f"⚠ {alerte}")
+                notify_desktop("⚠ Routeur suspect", alerte)
+            self.dernier_reseau = nouveau
+        self.reseau = nouveau
+        self.own_macs = get_own_macs() | {m for m in (nouveau.get("own_mac"),) if m}
+
+        if self.ecoute and not self.ecoute.is_alive():
+            erreur = self.ecoute.erreur or "raison inconnue"
+            print(f"{YELLOW}⚡ Écoute instantanée arrêtée ({erreur}) — nouvel essai.{RESET}")
+            log_event(f"écoute instantanée arrêtée — {erreur}")
+            self.ecoute = None
+        if self.ecoute is None and nouveau.get("iface"):
+            self._lancer_ecoute()
+
+    # --- appareils --------------------------------------------------------
+    def traiter(self, lus):
+        """Traite ce que l'écoute a entendu. Renvoie True si la base a changé."""
+        annoncer = self.presents_avant is not None   # pas de « connexion » avant la 1re base
+        now, heure = _maintenant(), _heure()
+        nouveaux, modifie = [], False
+        for mac, ip in lus:
+            if mac in self.own_macs:
+                continue
+            self.entendus.add(mac)
+            resultat = handle_live_event(mac, ip, self.known, self.presents, self.own_macs, now)
+            if resultat is None:
+                continue
+            modifie = True
+            genre, valeur = resultat
+            if genre == "nouveau":
+                print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil (instantané) : {valeur['ip']} "
+                      f"{valeur['mac']} — nom et fabricant complétés au prochain scan{RESET}")
+                nouveaux.append(valeur)
+            elif genre == "connexion" and annoncer:
+                print(f"{GREEN}[{heure}] 🟢 {_nom(self.known, valeur)} s'est connecté au réseau{RESET}")
+                log_event(f"🟢 connexion — {_nom(self.known, valeur)} ({valeur})")
+        if nouveaux:
+            alert_new_devices(nouveaux, self.cfg)
+        return modifie
+
+    def tour_de_scan(self):
+        print(f"\n{DIM}{'=' * 60}{RESET}")
+        print(f"{DIM}Scan — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
+        self._verifier_reseau()
+        reseau = self.reseau
+        if not reseau.get("iface"):
+            print(f"{YELLOW}Pas de réseau : nouvel essai dans {self.interval} s.{RESET}")
+            return
+
+        devices = scan_network(interactif=False, subnet=reseau.get("subnet"),
+                               iface=reseau["iface"] if reseau.get("arp") is not False else None)
+        heure = _heure()
+        if not devices:
+            # Un scan raté n'est pas « tout le monde est parti » : la présence
+            # reste telle quelle, et ce que l'écoute entend compte toujours.
+            if devices is None:
+                print(f"{YELLOW}[{heure}] ⚠ Scan impossible : ni arp-scan ni nmap n'ont pu scanner "
+                      f"(sudo apt install arp-scan). L'écoute instantanée continue.{RESET}")
+            else:
+                print(f"{YELLOW}[{heure}] ⚠ Scan sans résultat — présence inchangée.{RESET}")
+            if self.traiter(_vider(self.evenements)):
+                save_known_devices(self.known)
+            return
+
+        devices = [d for d in devices if d["mac"] not in self.own_macs]
+        new_devices = update_from_devices(devices, self.known, _maintenant())
+        nouveaux_macs = {d["mac"] for d in new_devices}
+        self.presents |= nouveaux_macs
+        for d in new_devices:
+            print(f"{RED}{BOLD}[{heure}] 🆕 NOUVEL appareil : {d['ip']} {d['mac']} "
+                  f"({d.get('vendor') or '?'}){RESET}")
+        if new_devices:
+            alert_new_devices(new_devices, self.cfg)
+
+        # Ce que l'écoute a entendu pendant le scan compte pour CE scan.
+        if DELAI_FIN_SCAN:
+            time.sleep(DELAI_FIN_SCAN)
+        self.traiter(_vider(self.evenements))
+
+        presents_maintenant = {d["mac"] for d in devices} | self.entendus
+        if self.presents_avant is not None:
+            for mac in sorted(presents_maintenant - self.presents - nouveaux_macs):
+                print(f"{GREEN}[{heure}] 🟢 {_nom(self.known, mac)} s'est connecté au réseau{RESET}")
+                log_event(f"🟢 connexion — {_nom(self.known, mac)} ({mac})")
+            for mac in sorted(self.presents_avant - presents_maintenant):
+                print(f"{YELLOW}[{heure}] 🔴 {_nom(self.known, mac)} s'est déconnecté du réseau{RESET}")
+                log_event(f"🔴 déconnexion — {_nom(self.known, mac)} ({mac})")
+        if not new_devices:
+            print(f"{DIM}{len(presents_maintenant)} appareil(s) présent(s), rien de nouveau.{RESET}")
+
+        save_known_devices(self.known)
+        self.presents_avant = set(presents_maintenant)
+        self.presents = set(presents_maintenant)
+        self.entendus = set()
+
+    def boucle(self):
+        prochain_scan = 0.0
+        while True:
+            if time.monotonic() >= prochain_scan:
+                self.tour_de_scan()
+                prochain_scan = time.monotonic() + self.interval
+            # Entre deux scans : on traite tout de suite ce que l'écoute entend.
+            attente = max(0.0, prochain_scan - time.monotonic())
+            try:
+                premier = self.evenements.get(timeout=attente)
+            except queue.Empty:
+                continue
+            if self.traiter([premier] + _vider(self.evenements)):
+                save_known_devices(self.known)
+
+    def arreter(self):
+        self._arreter_ecoute()
+
+
+def do_watch(known, interval, cfg=None, fabrique_ecoute=None):
+    """Surveille le réseau en temps réel. Alerte sur :
+       - tout appareil JAMAIS VU (intrus potentiel), dès son premier paquet ARP :
+         bip + notification + e-mail + journal ;
+       - toute connexion / déconnexion d'un appareil connu (présence) ;
+       - tout changement de réseau (autre wifi, autre routeur, réseau perdu)
+         et toute nouvelle MAC pour le routeur d'un même réseau.
+    Un scan actif a lieu toutes les `interval` secondes en renfort (appareils
+    silencieux, déconnexions). Ne regarde jamais ce qu'un appareil fait —
+    seulement s'il est présent. Ctrl+C pour arrêter."""
+    cfg = cfg if cfg is not None else load_config()
+    interval = max(INTERVALLE_MIN, int(interval))
+    surveillance = Surveillance(known, interval, cfg, fabrique_ecoute)
+    try:
+        surveillance.demarrer()
+        surveillance.boucle()
     except KeyboardInterrupt:
         print(f"\n{LIME}Surveillance arrêtée.{RESET}")
         log_event("Surveillance arrêtée")
+    finally:
+        surveillance.arreter()
 
 
 # --------------------------------------------------------------------------
@@ -1091,7 +1816,7 @@ def do_report_menu(known):
 
 
 def do_watch_menu(known, cfg):
-    raw = input("Intervalle entre les scans en secondes [60]: ").strip() or "60"
+    raw = input(f"Intervalle entre les scans de renfort en secondes (minimum {INTERVALLE_MIN}) [60]: ").strip() or "60"
     try:
         interval = int(raw)
     except ValueError:
@@ -1106,7 +1831,7 @@ def do_watch_menu(known, cfg):
 def print_menu():
     print(f"\n{CYAN}{BOLD}=== scan-info-id-espion ==={RESET}")
     print(f"{CYAN}1.{RESET} Scanner le réseau maintenant")
-    print(f"{CYAN}2.{RESET} Surveillance en continu (intrus + connexion/déconnexion)")
+    print(f"{CYAN}2.{RESET} Surveillance en temps réel (nouvel appareil instantané + connexion/déconnexion)")
     print(f"{CYAN}3.{RESET} Voir les appareils déjà connus")
     print(f"{CYAN}4.{RESET} Voir l'historique de présence")
     print(f"{CYAN}5.{RESET} Renommer un appareil")
@@ -1172,7 +1897,8 @@ def main():
     parser.add_argument("--scan", action="store_true",
                          help="Scanner directement sans passer par le menu")
     parser.add_argument("--watch", nargs="?", const=60, type=int, metavar="SECONDES",
-                         help="Surveiller en boucle (par défaut toutes les 60 s) et alerter sur tout nouvel appareil")
+                         help="Surveiller en temps réel : alerte dès qu'un nouvel appareil se connecte, "
+                              "plus un scan de renfort toutes les SECONDES (60 par défaut, 15 minimum)")
     parser.add_argument("--report", choices=["html", "csv", "securite"], metavar="FORMAT",
                          help="Exporter un rapport des appareils connus (html, csv ou securite) puis quitter")
     parser.add_argument("--audit", action="store_true",
