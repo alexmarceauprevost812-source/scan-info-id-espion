@@ -539,9 +539,9 @@ def run_vuln_script(ip):
         )
         return result.stdout
     except FileNotFoundError:
-        return None
+        return None  # nmap absent → résultat non concluant
     except subprocess.TimeoutExpired:
-        return "(scan abandonné après 4 minutes — trop long)"
+        return None  # délai dépassé → non concluant (surtout PAS un « rien trouvé »)
 
 
 def do_vuln_scan(known):
@@ -610,7 +610,7 @@ def do_vuln_scan(known):
         print(f"\n{CYAN}Recherche de vulnérabilités en cours...{RESET}\n")
         resultat = run_vuln_script(ip)
         if resultat is None:
-            print(f"{RED}nmap n'est pas installé.{RESET}")
+            print(f"{YELLOW}Scan non concluant : nmap absent ou délai dépassé.{RESET}")
         else:
             print(resultat)
 
@@ -857,14 +857,24 @@ def do_full_audit(known, cfg=None, assume_yes=False):
         # Recherche de vulnérabilités connues (CVE) — scripts nmap standards
         print(f"{DIM}  Recherche de vulnérabilités connues...{RESET}")
         vuln = run_vuln_script(ip)
-        cves = parse_cves(vuln)
-        if cves:
-            print(f"{RED}  ⚠ Vulnérabilités référencées : {', '.join(cves)}{RESET}")
-            known[mac]["cves"] = cves
-            log_event(f"⚠ CVE sur {ip} ({mac}) : {', '.join(cves)}")
+        if vuln is None:
+            # Scan non concluant (nmap absent ou délai dépassé) : surtout NE PAS
+            # effacer les CVE déjà notées en les prenant pour un « rien trouvé ».
+            anciennes = known[mac].get("cves")
+            if anciennes:
+                print(f"{YELLOW}  Scan de vulnérabilités non concluant — on garde les CVE "
+                      f"déjà connues : {', '.join(anciennes)}{RESET}")
+            else:
+                print(f"{YELLOW}  Scan de vulnérabilités non concluant (nmap absent ou délai dépassé).{RESET}")
         else:
-            print(f"{GREEN}  Aucune vulnérabilité connue repérée.{RESET}")
-            known[mac].pop("cves", None)
+            cves = parse_cves(vuln)
+            if cves:
+                print(f"{RED}  ⚠ Vulnérabilités référencées : {', '.join(cves)}{RESET}")
+                known[mac]["cves"] = cves
+                log_event(f"⚠ CVE sur {ip} ({mac}) : {', '.join(cves)}")
+            else:
+                print(f"{GREEN}  Aucune vulnérabilité connue repérée.{RESET}")
+                known[mac].pop("cves", None)
         save_known_devices(known)
 
     # 3) Wifi + machine locale

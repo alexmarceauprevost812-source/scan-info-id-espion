@@ -244,3 +244,23 @@ def test_run_auto_migre_avant_de_lire_la_config(reseau, tmp_path):
     assert not legacy.exists()
     # l'intervalle hérité a bien été pris en compte
     assert json.load(open(m.STATUS_FILE))["interval"] == 300
+
+
+def test_audit_timeout_vuln_conserve_les_cve_connues(reseau, monkeypatch, capsys):
+    """Un scan de vulnérabilités non concluant (None) ne doit pas effacer les
+    CVE déjà enregistrées ni annoncer « rien trouvé » (finding Codex)."""
+    mac = TEL["mac"]
+    known = {mac: {"first_seen": "x", "last_seen": "y", "times_seen": 2,
+                   "last_ip": TEL["ip"], "cves": ["CVE-2017-0144"]}}
+    monkeypatch.setattr(m, "scan_network", lambda interactive=True, subnet=None: [dict(TEL)])
+    monkeypatch.setattr(m, "run_port_scan",
+                        lambda ip: {"ports": [], "os": None, "device_type": None, "timeout": False})
+    monkeypatch.setattr(m, "run_vuln_script", lambda ip: None)  # non concluant
+    monkeypatch.setattr(m, "do_wifi_check", lambda: None)
+    monkeypatch.setattr(m, "do_self_audit", lambda: None)
+    monkeypatch.setattr(m, "confirm_ownership", lambda: True)
+
+    m.do_full_audit(known, cfg={"network_owner_confirmed": True}, assume_yes=True)
+    assert known[mac].get("cves") == ["CVE-2017-0144"]  # conservées
+    out = capsys.readouterr().out
+    assert "Aucune vulnérabilité" not in out
