@@ -1430,7 +1430,8 @@ def auto_cycle(known, cfg, state, now_ts=None):
             risques = risky_ports_of(res["ports"])
             known[d["mac"]].update(device_type=res["device_type"], os=res["os"], risky_ports=risques)
             if risques:
-                _alerte(state, f"Ports à risque sur {d['ip']} ({d['mac']}) : {', '.join(risques)}", cfg)
+                _alerte(state, f"Ports à risque sur {d['ip']} ({d['mac']}) : {', '.join(risques)}", cfg,
+                        sujet="⚠ Ports à risque sur un nouvel appareil")
 
     # 5) Audit complet périodique (seulement si c'est TON réseau)
     if proprio and _due(state, "last_audit_ts", reglages.get("full_audit_every"), now_ts):

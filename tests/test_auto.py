@@ -113,6 +113,7 @@ def test_audits_autorises_si_proprietaire(reseau):
     assert reseau["appels"]["audit"] == 1
     assert known[TEL["mac"]]["risky_ports"] == ["23/telnet"]
     assert any("Ports à risque" in a for a in state["alerts"])
+    assert any("Ports à risque" in s for s in reseau["appels"]["mail"])  # e-mail envoyé
 
 
 def test_rapports_periodiques(reseau, tmp_path):
